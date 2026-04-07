@@ -1,0 +1,11 @@
+Revision history for LLM::Data::Pipeline
+
+{{$NEXT}}
+
+0.1.0  2026-04-07T18:51:48+01:00
+    - Initial release
+    - Step role with requires/optional/provides declarations
+    - Context data bag with JSON snapshot/restore
+    - Plan with dependency validation
+    - Runner with sequential execution, checkpointing, and resume
+    - Progress callbacks (start/complete/skip events)

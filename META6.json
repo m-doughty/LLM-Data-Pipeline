@@ -1,0 +1,33 @@
+{
+  "auth": "zef:apogee",
+  "authors": [
+    "Matt Doughty"
+  ],
+  "build-depends": [
+  ],
+  "depends": [
+    "JSON::Fast"
+  ],
+  "description": "Generic pipeline framework for composing and running sequential data processing steps with checkpointing",
+  "license": "Artistic-2.0",
+  "name": "LLM::Data::Pipeline",
+  "perl": "6.d",
+  "provides": {
+    "LLM::Data::Pipeline": "lib/LLM/Data/Pipeline.rakumod",
+    "LLM::Data::Pipeline::Context": "lib/LLM/Data/Pipeline/Context.rakumod",
+    "LLM::Data::Pipeline::Plan": "lib/LLM/Data/Pipeline/Plan.rakumod",
+    "LLM::Data::Pipeline::Runner": "lib/LLM/Data/Pipeline/Runner.rakumod",
+    "LLM::Data::Pipeline::Step": "lib/LLM/Data/Pipeline/Step.rakumod"
+  },
+  "resources": [
+  ],
+  "source-url": "https://github.com/m-doughty/LLM-Data-Pipeline.git",
+  "tags": [
+    "pipeline",
+    "data",
+    "processing"
+  ],
+  "test-depends": [
+  ],
+  "version": "0.1.0"
+}

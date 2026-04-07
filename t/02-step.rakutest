@@ -1,0 +1,75 @@
+use Test;
+use lib 'lib';
+use LLM::Data::Pipeline::Step;
+use LLM::Data::Pipeline::Context;
+
+plan 5;
+
+# --- Test step implementations ---
+
+class MinimalStep does LLM::Data::Pipeline::Step {
+	method name(--> Str:D) { 'minimal' }
+	method description(--> Str:D) { 'A minimal step' }
+	method provides(--> List) { ('output',) }
+	method execute(LLM::Data::Pipeline::Context:D $ctx --> Nil) {
+		$ctx.set('output', 'done');
+	}
+}
+
+class FullStep does LLM::Data::Pipeline::Step {
+	method name(--> Str:D) { 'full' }
+	method description(--> Str:D) { 'Step with all methods overridden' }
+	method requires(--> List) { ('input',) }
+	method optional(--> List) { ('config',) }
+	method provides(--> List) { ('result',) }
+	method execute(LLM::Data::Pipeline::Context:D $ctx --> Nil) {
+		my Str:D $input = $ctx.get('input');
+		my Str $config = $ctx.get('config') // 'default';
+		$ctx.set('result', "$input-$config");
+	}
+}
+
+subtest 'Minimal step composes successfully' => {
+	plan 3;
+	my MinimalStep $step .= new;
+	is $step.name, 'minimal', 'name returns correct value';
+	is $step.description, 'A minimal step', 'description correct';
+	ok $step ~~ LLM::Data::Pipeline::Step, 'Does the Step role';
+};
+
+subtest 'Default requires and optional return empty lists' => {
+	plan 2;
+	my MinimalStep $step .= new;
+	is-deeply $step.requires, (), 'requires returns empty list';
+	is-deeply $step.optional, (), 'optional returns empty list';
+};
+
+subtest 'Custom requires/optional/provides' => {
+	plan 3;
+	my FullStep $step .= new;
+	is-deeply $step.requires, ('input',), 'requires returns declared keys';
+	is-deeply $step.optional, ('config',), 'optional returns declared keys';
+	is-deeply $step.provides, ('result',), 'provides returns declared keys';
+};
+
+subtest 'Execute mutates context' => {
+	plan 1;
+	my MinimalStep $step .= new;
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	$step.execute($ctx);
+	is $ctx.get('output'), 'done', 'Context updated by execute';
+};
+
+subtest 'Execute with requires and optional' => {
+	plan 2;
+	my FullStep $step .= new;
+	my LLM::Data::Pipeline::Context $ctx .= new;
+
+	$ctx.set('input', 'hello');
+	$step.execute($ctx);
+	is $ctx.get('result'), 'hello-default', 'Uses default when optional absent';
+
+	$ctx.set('config', 'custom');
+	$step.execute($ctx);
+	is $ctx.get('result'), 'hello-custom', 'Uses optional when present';
+};

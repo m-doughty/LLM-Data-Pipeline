@@ -1,0 +1,159 @@
+use Test;
+use lib 'lib';
+use LLM::Data::Pipeline::Plan;
+use LLM::Data::Pipeline::Step;
+use LLM::Data::Pipeline::Context;
+
+plan 12;
+
+# --- Test step helpers ---
+
+class NoReqStep does LLM::Data::Pipeline::Step {
+	has Str:D $.step-name is required;
+	has List $.step-provides = ();
+	method name(--> Str:D) { $!step-name }
+	method description(--> Str:D) { "Test step $!step-name" }
+	method provides(--> List) { $!step-provides }
+	method execute(LLM::Data::Pipeline::Context:D $ctx --> Nil) { }
+}
+
+class ReqStep does LLM::Data::Pipeline::Step {
+	has Str:D $.step-name is required;
+	has List $.step-requires = ();
+	has List $.step-optional = ();
+	has List $.step-provides = ();
+	method name(--> Str:D) { $!step-name }
+	method description(--> Str:D) { "Test step $!step-name" }
+	method requires(--> List) { $!step-requires }
+	method optional(--> List) { $!step-optional }
+	method provides(--> List) { $!step-provides }
+	method execute(LLM::Data::Pipeline::Context:D $ctx --> Nil) { }
+}
+
+# --- Tests ---
+
+subtest 'Empty plan validates' => {
+	plan 1;
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	ok $plan.validate, 'Empty plan is valid';
+};
+
+subtest 'Single step, no requirements' => {
+	plan 1;
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(NoReqStep.new(:step-name('a'), :step-provides(('x',))));
+	ok $plan.validate, 'Step with no requires validates';
+};
+
+subtest 'Single step, requirement met by context' => {
+	plan 1;
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(ReqStep.new(:step-name('a'), :step-requires(('input',)), :step-provides(('output',))));
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	$ctx.set('input', 'value');
+	ok $plan.validate($ctx), 'Requirement met by context';
+};
+
+subtest 'Single step, requirement NOT met' => {
+	plan 2;
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(ReqStep.new(:step-name('a'), :step-requires(('missing-key',)), :step-provides(('output',))));
+	try {
+		$plan.validate;
+		CATCH {
+			default {
+				ok .message.contains("Step 'a'"), 'Error names the step';
+				ok .message.contains("missing-key"), 'Error names the missing key';
+			}
+		}
+	}
+};
+
+subtest 'Chained steps — B requires what A provides' => {
+	plan 1;
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(NoReqStep.new(:step-name('a'), :step-provides(('intermediate',))));
+	$plan.add-step(ReqStep.new(:step-name('b'), :step-requires(('intermediate',)), :step-provides(('output',))));
+	ok $plan.validate, 'Chained dependency validates';
+};
+
+subtest 'Broken chain — B requires key no prior step provides' => {
+	plan 1;
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(NoReqStep.new(:step-name('a'), :step-provides(('something-else',))));
+	$plan.add-step(ReqStep.new(:step-name('b'), :step-requires(('needed',)), :step-provides(('output',))));
+	dies-ok { $plan.validate }, 'Broken chain fails validation';
+};
+
+subtest 'Multiple missing keys all reported' => {
+	plan 3;
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(ReqStep.new(:step-name('a'), :step-requires(('x', 'y')), :step-provides(('output',))));
+	try {
+		$plan.validate;
+		CATCH {
+			default {
+				ok .message.contains("x"), 'Reports missing key x';
+				ok .message.contains("y"), 'Reports missing key y';
+				ok .message.contains("Step 'a'"), 'Reports step name';
+			}
+		}
+	}
+};
+
+subtest 'Multiple failing steps all reported' => {
+	plan 2;
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(ReqStep.new(:step-name('a'), :step-requires(('missing-a',)), :step-provides(('x',))));
+	$plan.add-step(ReqStep.new(:step-name('b'), :step-requires(('missing-b',)), :step-provides(('y',))));
+	try {
+		$plan.validate;
+		CATCH {
+			default {
+				ok .message.contains("Step 'a'"), 'Reports step a';
+				ok .message.contains("Step 'b'"), 'Reports step b';
+			}
+		}
+	}
+};
+
+subtest 'add-step / steps ordering preserved' => {
+	plan 3;
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(NoReqStep.new(:step-name('first'), :step-provides(('a',))));
+	$plan.add-step(NoReqStep.new(:step-name('second'), :step-provides(('b',))));
+	$plan.add-step(NoReqStep.new(:step-name('third'), :step-provides(('c',))));
+	my @steps = $plan.steps;
+	is @steps[0].name, 'first', 'First step preserved';
+	is @steps[1].name, 'second', 'Second step preserved';
+	is @steps[2].name, 'third', 'Third step preserved';
+};
+
+subtest 'Duplicate step names fails validation' => {
+	plan 1;
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(NoReqStep.new(:step-name('dup'), :step-provides(('a',))));
+	$plan.add-step(NoReqStep.new(:step-name('dup'), :step-provides(('b',))));
+	dies-ok { $plan.validate }, 'Duplicate step names fail validation';
+};
+
+subtest 'Context pre-seeds keys' => {
+	plan 1;
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(ReqStep.new(:step-name('a'), :step-requires(('seed',)), :step-provides(('output',))));
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	$ctx.set('seed', 'value');
+	ok $plan.validate($ctx), 'Pre-seeded context key satisfies requirement';
+};
+
+subtest 'Optional keys absent do not fail validation' => {
+	plan 1;
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(ReqStep.new(
+		:step-name('a'),
+		:step-requires(()),
+		:step-optional(('missing-optional',)),
+		:step-provides(('output',))
+	));
+	ok $plan.validate, 'Absent optional key does not fail';
+};

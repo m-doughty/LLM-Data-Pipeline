@@ -1,0 +1,254 @@
+use Test;
+use lib 'lib';
+use LLM::Data::Pipeline::Runner;
+use LLM::Data::Pipeline::Plan;
+use LLM::Data::Pipeline::Step;
+use LLM::Data::Pipeline::Context;
+use JSON::Fast;
+
+plan 14;
+
+my IO::Path $tmpdir = $*TMPDIR.add("pipeline-runner-test-{$*PID}");
+$tmpdir.mkdir;
+
+END { $tmpdir.dir>>.unlink if $tmpdir.d; $tmpdir.rmdir if $tmpdir.d; }
+
+sub tmp-path(Str:D $name --> IO::Path:D) { $tmpdir.add($name) }
+
+# --- Test step helpers ---
+
+class SetKeyStep does LLM::Data::Pipeline::Step {
+	has Str:D $.step-name is required;
+	has Str:D $.key is required;
+	has $.val is required;
+	method name(--> Str:D) { $!step-name }
+	method description(--> Str:D) { "Sets $!key" }
+	method provides(--> List) { ($!key,) }
+	method execute(LLM::Data::Pipeline::Context:D $ctx --> Nil) {
+		$ctx.set($!key, $!val);
+	}
+}
+
+class RequireKeyStep does LLM::Data::Pipeline::Step {
+	has Str:D $.step-name is required;
+	has Str:D $.input-key is required;
+	has Str:D $.output-key is required;
+	method name(--> Str:D) { $!step-name }
+	method description(--> Str:D) { "Reads $!input-key, writes $!output-key" }
+	method requires(--> List) { ($!input-key,) }
+	method provides(--> List) { ($!output-key,) }
+	method execute(LLM::Data::Pipeline::Context:D $ctx --> Nil) {
+		my $input = $ctx.get($!input-key);
+		$ctx.set($!output-key, "derived-from-$input");
+	}
+}
+
+class FailStep does LLM::Data::Pipeline::Step {
+	has Str:D $.step-name is required;
+	method name(--> Str:D) { $!step-name }
+	method description(--> Str:D) { 'Always fails' }
+	method provides(--> List) { ('never',) }
+	method execute(LLM::Data::Pipeline::Context:D $ctx --> Nil) {
+		die "FailStep intentional error";
+	}
+}
+
+# --- Tests ---
+
+subtest 'Run single step — context updated' => {
+	plan 1;
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('set-x'), :key('x'), :val(42)));
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	my LLM::Data::Pipeline::Runner $runner .= new;
+	$runner.run($plan, $ctx);
+	is $ctx.get('x'), 42, 'Context has value set by step';
+};
+
+subtest 'Run multi-step — steps execute in order' => {
+	plan 2;
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('set-input'), :key('input'), :val('hello')));
+	$plan.add-step(RequireKeyStep.new(:step-name('derive'), :input-key('input'), :output-key('output')));
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	LLM::Data::Pipeline::Runner.new.run($plan, $ctx);
+	is $ctx.get('input'), 'hello', 'First step ran';
+	is $ctx.get('output'), 'derived-from-hello', 'Second step used first step output';
+};
+
+subtest 'Validation failure — dies before executing' => {
+	plan 1;
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(RequireKeyStep.new(:step-name('needs-input'), :input-key('missing'), :output-key('out')));
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	dies-ok { LLM::Data::Pipeline::Runner.new.run($plan, $ctx) }, 'Dies on validation failure';
+};
+
+subtest 'Step failure — error propagates' => {
+	plan 1;
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(FailStep.new(:step-name('fail')));
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	dies-ok { LLM::Data::Pipeline::Runner.new.run($plan, $ctx) }, 'Step failure propagates';
+};
+
+subtest 'Checkpoint writing — file exists after run' => {
+	plan 1;
+	my IO::Path $cp = tmp-path('checkpoint-exists.json');
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('a'), :key('x'), :val(1)));
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	LLM::Data::Pipeline::Runner.new.run($plan, $ctx, :checkpoint-path($cp));
+	ok $cp.e, 'Checkpoint file created';
+};
+
+subtest 'Checkpoint content — has completed-steps and context' => {
+	plan 3;
+	my IO::Path $cp = tmp-path('checkpoint-content.json');
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('step-a'), :key('x'), :val(99)));
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	LLM::Data::Pipeline::Runner.new.run($plan, $ctx, :checkpoint-path($cp));
+
+	my %data = from-json($cp.slurp);
+	ok %data<completed-steps>:exists, 'Has completed-steps';
+	is %data<completed-steps>[0], 'step-a', 'Step name recorded';
+	is %data<context><x>, 99, 'Context snapshot correct';
+};
+
+subtest 'Resume — skips completed steps, runs remaining' => {
+	plan 3;
+	# First run: complete step-a, checkpoint
+	my IO::Path $cp = tmp-path('checkpoint-resume.json');
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('step-a'), :key('x'), :val(10)));
+	$plan.add-step(SetKeyStep.new(:step-name('step-b'), :key('y'), :val(20)));
+	my LLM::Data::Pipeline::Context $ctx .= new;
+
+	# Manually create a checkpoint as if step-a completed
+	my %fake-checkpoint = %(
+		completed-steps => ('step-a',),
+		context => %(:x(10)),
+	);
+	$cp.spurt(to-json(%fake-checkpoint));
+
+	# Resume
+	my @events;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		:on-step(-> Str:D $name, Str:D $event { @events.push("$name:$event") })
+	);
+	my LLM::Data::Pipeline::Context $result = $runner.resume($plan, $cp);
+
+	is $result.get('x'), 10, 'step-a value preserved from checkpoint';
+	is $result.get('y'), 20, 'step-b executed';
+	ok @events.grep(*.contains('step-a:skip')).elems > 0, 'step-a was skipped';
+};
+
+subtest 'Resume from nonexistent file dies' => {
+	plan 1;
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	dies-ok {
+		LLM::Data::Pipeline::Runner.new.resume($plan, tmp-path('nonexistent.json'))
+	}, 'Dies when checkpoint file missing';
+};
+
+subtest 'Resume when all steps complete — returns context unchanged' => {
+	plan 1;
+	my IO::Path $cp = tmp-path('checkpoint-all-done.json');
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('only'), :key('x'), :val(1)));
+
+	my %checkpoint = %(
+		completed-steps => ('only',),
+		context => %(:x(1)),
+	);
+	$cp.spurt(to-json(%checkpoint));
+
+	my LLM::Data::Pipeline::Context $result = LLM::Data::Pipeline::Runner.new.resume($plan, $cp);
+	is $result.get('x'), 1, 'Context unchanged when all steps already complete';
+};
+
+subtest 'on-step callback — start and complete events' => {
+	plan 1;
+	my @events;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		:on-step(-> Str:D $name, Str:D $event { @events.push("$name:$event") })
+	);
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('a'), :key('x'), :val(1)));
+	$plan.add-step(SetKeyStep.new(:step-name('b'), :key('y'), :val(2)));
+	$runner.run($plan, LLM::Data::Pipeline::Context.new);
+	is-deeply @events, ['a:start', 'a:complete', 'b:start', 'b:complete'],
+		'Events fire in correct order';
+};
+
+subtest 'on-step skip events for resumed steps' => {
+	plan 1;
+	my IO::Path $cp = tmp-path('checkpoint-skip-events.json');
+	my %checkpoint = %(
+		completed-steps => ('a',),
+		context => %(:x(1)),
+	);
+	$cp.spurt(to-json(%checkpoint));
+
+	my @events;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		:on-step(-> Str:D $name, Str:D $event { @events.push("$name:$event") })
+	);
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('a'), :key('x'), :val(1)));
+	$plan.add-step(SetKeyStep.new(:step-name('b'), :key('y'), :val(2)));
+	$runner.resume($plan, $cp);
+	is-deeply @events, ['a:skip', 'b:start', 'b:complete'], 'Skip event for resumed step';
+};
+
+subtest 'No checkpoint path — no file created' => {
+	plan 1;
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('a'), :key('x'), :val(1)));
+	LLM::Data::Pipeline::Runner.new.run($plan, LLM::Data::Pipeline::Context.new);
+	# Just verify we don't crash — no checkpoint to check
+	pass 'Runs without checkpoint path';
+};
+
+subtest 'Checkpoint round-trip — identical context' => {
+	plan 2;
+	my IO::Path $cp = tmp-path('checkpoint-roundtrip.json');
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('a'), :key('x'), :val('hello')));
+	$plan.add-step(SetKeyStep.new(:step-name('b'), :key('y'), :val(42)));
+
+	# Full run
+	my LLM::Data::Pipeline::Context $ctx1 .= new;
+	LLM::Data::Pipeline::Runner.new.run($plan, $ctx1, :checkpoint-path($cp));
+
+	# Resume from checkpoint (all complete, so nothing runs)
+	my LLM::Data::Pipeline::Context $ctx2 = LLM::Data::Pipeline::Runner.new.resume($plan, $cp);
+
+	is $ctx2.get('x'), 'hello', 'x preserved through checkpoint';
+	is $ctx2.get('y'), 42, 'y preserved through checkpoint';
+};
+
+subtest 'Checkpoint updates after each step' => {
+	plan 2;
+	my IO::Path $cp = tmp-path('checkpoint-incremental.json');
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('first'), :key('a'), :val(1)));
+	$plan.add-step(SetKeyStep.new(:step-name('second'), :key('b'), :val(2)));
+
+	my Int $check-count = 0;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		:on-step(-> Str:D $name, Str:D $event {
+			if $event eq 'complete' && $name eq 'first' {
+				# Read checkpoint mid-pipeline
+				my %mid = from-json($cp.slurp);
+				$check-count = %mid<completed-steps>.elems;
+			}
+		})
+	);
+	$runner.run($plan, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+	is $check-count, 1, 'After first step, checkpoint has 1 completed step';
+
+	my %final = from-json($cp.slurp);
+	is %final<completed-steps>.elems, 2, 'After second step, checkpoint has 2 completed steps';
+};

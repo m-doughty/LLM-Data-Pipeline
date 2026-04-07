@@ -1,0 +1,120 @@
+use Test;
+use lib 'lib';
+use LLM::Data::Pipeline::Context;
+
+plan 12;
+
+subtest 'Empty context has no keys' => {
+	plan 2;
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	is $ctx.keys.elems, 0, 'No keys';
+	nok $ctx.has('anything'), 'has returns False for absent key';
+};
+
+subtest 'set/get/has' => {
+	plan 3;
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	$ctx.set('name', 'Alice');
+	is $ctx.get('name'), 'Alice', 'get returns set value';
+	ok $ctx.has('name'), 'has returns True for present key';
+	nok $ctx.has('missing'), 'has returns False for absent key';
+};
+
+subtest 'Overwrite value' => {
+	plan 1;
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	$ctx.set('key', 'first');
+	$ctx.set('key', 'second');
+	is $ctx.get('key'), 'second', 'Second set overwrites first';
+};
+
+subtest 'Various value types' => {
+	plan 6;
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	$ctx.set('str', 'hello');
+	$ctx.set('int', 42);
+	$ctx.set('bool', True);
+	$ctx.set('array', [1, 2, 3]);
+	$ctx.set('hash', {:a(1), :b(2)});
+	$ctx.set('nil', Any);
+
+	is $ctx.get('str'), 'hello', 'String value';
+	is $ctx.get('int'), 42, 'Int value';
+	is $ctx.get('bool'), True, 'Bool value';
+	is-deeply $ctx.get('array'), [1, 2, 3], 'Array value';
+	is $ctx.get('hash')<a>, 1, 'Hash value';
+	nok $ctx.get('nil').defined, 'Nil/Any value';
+};
+
+subtest 'keys returns sorted list' => {
+	plan 1;
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	$ctx.set('zebra', 1);
+	$ctx.set('alpha', 2);
+	$ctx.set('middle', 3);
+	is-deeply $ctx.keys, ('alpha', 'middle', 'zebra'), 'Keys sorted alphabetically';
+};
+
+subtest 'snapshot returns deep copy' => {
+	plan 2;
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	$ctx.set('key', 'value');
+	my %snap = $ctx.snapshot;
+	%snap<key> = 'modified';
+	is $ctx.get('key'), 'value', 'Modifying snapshot does not affect context';
+	is %snap<key>, 'modified', 'Snapshot was modified';
+};
+
+subtest 'snapshot with nested structures' => {
+	plan 1;
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	$ctx.set('nested', {:a([1, 2, {:b(3)}])});
+	my %snap = $ctx.snapshot;
+	is %snap<nested><a>[2]<b>, 3, 'Nested structure preserved in snapshot';
+};
+
+subtest 'from-snapshot round-trip' => {
+	plan 3;
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	$ctx.set('name', 'Alice');
+	$ctx.set('count', 42);
+	$ctx.set('tags', ['a', 'b']);
+
+	my %snap = $ctx.snapshot;
+	my LLM::Data::Pipeline::Context $restored = LLM::Data::Pipeline::Context.from-snapshot(%snap);
+
+	is $restored.get('name'), 'Alice', 'String restored';
+	is $restored.get('count'), 42, 'Int restored';
+	is-deeply $restored.get('tags'), ['a', 'b'], 'Array restored';
+};
+
+subtest 'from-snapshot with empty hash' => {
+	plan 1;
+	my LLM::Data::Pipeline::Context $ctx = LLM::Data::Pipeline::Context.from-snapshot({});
+	is $ctx.keys.elems, 0, 'Empty snapshot produces empty context';
+};
+
+subtest 'Snapshot isolation from later context changes' => {
+	plan 1;
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	$ctx.set('key', 'before');
+	my %snap = $ctx.snapshot;
+	$ctx.set('key', 'after');
+	is %snap<key>, 'before', 'Snapshot not affected by later context changes';
+};
+
+subtest 'get returns Any for absent key' => {
+	plan 1;
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	nok $ctx.get('missing').defined, 'Absent key returns undefined';
+};
+
+subtest 'Multiple set/get operations' => {
+	plan 2;
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	for ^100 -> Int $i {
+		$ctx.set("key-$i", $i);
+	}
+	is $ctx.keys.elems, 100, '100 keys stored';
+	is $ctx.get('key-50'), 50, 'Random access correct';
+};

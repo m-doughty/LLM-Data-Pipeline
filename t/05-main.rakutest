@@ -1,0 +1,93 @@
+use Test;
+use lib 'lib';
+use LLM::Data::Pipeline;
+use LLM::Data::Pipeline::Context;
+use LLM::Data::Pipeline::Step;
+use LLM::Data::Pipeline::Plan;
+use LLM::Data::Pipeline::Runner;
+
+plan 3;
+
+my IO::Path $tmpdir = $*TMPDIR.add("pipeline-main-test-{$*PID}");
+$tmpdir.mkdir;
+
+END { $tmpdir.dir>>.unlink if $tmpdir.d; $tmpdir.rmdir if $tmpdir.d; }
+
+# --- Test step helpers ---
+
+class StepA does LLM::Data::Pipeline::Step {
+	method name(--> Str:D) { 'generate-synopsis' }
+	method description(--> Str:D) { 'Generate story synopsis' }
+	method provides(--> List) { ('synopsis',) }
+	method execute(LLM::Data::Pipeline::Context:D $ctx --> Nil) {
+		$ctx.set('synopsis', 'A tale of two cities...');
+	}
+}
+
+class StepB does LLM::Data::Pipeline::Step {
+	method name(--> Str:D) { 'extract-characters' }
+	method description(--> Str:D) { 'Extract characters from synopsis' }
+	method requires(--> List) { ('synopsis',) }
+	method provides(--> List) { ('characters',) }
+	method execute(LLM::Data::Pipeline::Context:D $ctx --> Nil) {
+		$ctx.set('characters', ['Alice', 'Bob']);
+	}
+}
+
+class StepC does LLM::Data::Pipeline::Step {
+	method name(--> Str:D) { 'generate-output' }
+	method description(--> Str:D) { 'Generate final output' }
+	method requires(--> List) { ('synopsis', 'characters') }
+	method provides(--> List) { ('output',) }
+	method execute(LLM::Data::Pipeline::Context:D $ctx --> Nil) {
+		my Str:D $synopsis = $ctx.get('synopsis');
+		my @chars = $ctx.get('characters').list;
+		$ctx.set('output', "Story: $synopsis | Characters: {@chars.join(', ')}");
+	}
+}
+
+# --- Tests ---
+
+subtest 'All types accessible via use LLM::Data::Pipeline' => {
+	plan 4;
+	ok LLM::Data::Pipeline::Context.new ~~ LLM::Data::Pipeline::Context, 'Context available';
+	ok StepA.new ~~ LLM::Data::Pipeline::Step, 'Step role available';
+	ok LLM::Data::Pipeline::Plan.new ~~ LLM::Data::Pipeline::Plan, 'Plan available';
+	ok LLM::Data::Pipeline::Runner.new ~~ LLM::Data::Pipeline::Runner, 'Runner available';
+};
+
+subtest 'End-to-end: 3-step pipeline' => {
+	plan 3;
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(StepA.new);
+	$plan.add-step(StepB.new);
+	$plan.add-step(StepC.new);
+
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	LLM::Data::Pipeline::Runner.new.run($plan, $ctx);
+
+	is $ctx.get('synopsis'), 'A tale of two cities...', 'Synopsis generated';
+	is-deeply $ctx.get('characters'), ['Alice', 'Bob'], 'Characters extracted';
+	ok $ctx.get('output').contains('Alice'), 'Output includes character names';
+};
+
+subtest 'End-to-end with checkpoint and resume' => {
+	plan 2;
+	my IO::Path $cp = $tmpdir.add('e2e-checkpoint.json');
+
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(StepA.new);
+	$plan.add-step(StepB.new);
+	$plan.add-step(StepC.new);
+
+	# Full run with checkpoint
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	LLM::Data::Pipeline::Runner.new.run($plan, $ctx, :checkpoint-path($cp));
+
+	# Resume from checkpoint (all complete)
+	my LLM::Data::Pipeline::Context $resumed =
+		LLM::Data::Pipeline::Runner.new.resume($plan, $cp);
+
+	is $resumed.get('synopsis'), 'A tale of two cities...', 'Synopsis preserved through resume';
+	ok $resumed.get('output').contains('Alice'), 'Output preserved through resume';
+};
