@@ -2,6 +2,10 @@ Revision history for LLM::Data::Pipeline
 
 {{$NEXT}}
 
+0.1.1  2026-04-29T23:51:00+01:00
+    - Bump Github actions to use node 24+
+    - Added auth specifiers to META6.json dependencies
+
 0.1.0  2026-04-07T18:51:48+01:00
     - Initial release
     - Step role with requires/optional/provides declarations

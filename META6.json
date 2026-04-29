@@ -6,7 +6,7 @@
   "build-depends": [
   ],
   "depends": [
-    "JSON::Fast"
+    "JSON::Fast:ver<0.19>:auth<cpan:TIMOTIMO>"
   ],
   "description": "Generic pipeline framework for composing and running sequential data processing steps with checkpointing",
   "license": "Artistic-2.0",
@@ -29,5 +29,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.1.0"
+  "version": "0.1.1"
 }
