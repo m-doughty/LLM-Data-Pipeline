@@ -1,0 +1,221 @@
+use Test;
+use lib 'lib', 't/lib';
+use LLM::Data::Pipeline::Runner;
+use LLM::Data::Pipeline::Plan;
+use LLM::Data::Pipeline::Context;
+use LLM::Data::Pipeline::Event;
+use LLM::Data::Pipeline::Exceptions;
+use LLM::Data::Pipeline::RetryPolicy;
+use PipelineTestKit;
+use JSON::Fast;
+use Digest::SHA256::Native;
+
+plan 7;
+
+my IO::Path $tmpdir = $*TMPDIR.add("pipeline-items-resume-{$*PID}");
+$tmpdir.mkdir;
+END { $tmpdir.dir>>.unlink if $tmpdir.d; $tmpdir.rmdir if $tmpdir.d; }
+sub tmp(Str:D $n) { $tmpdir.add($n) }
+
+sub keys-sha(*@keys)   { sha256-hex(to-json(@keys.list, :sorted-keys)) }
+sub items-sha(*@items) { sha256-hex(to-json(@items.list, :sorted-keys)) }
+
+subtest 'Mid-step resume: recovers results, re-runs only pending' => {
+	plan 5;
+	my IO::Path $cp = tmp('mid.checkpoint.json');
+	# Hand-craft a v2 checkpoint: step 's' in progress, item 'a' already done.
+	my %checkpoint = (
+		version         => 2,
+		run-id          => 'lineage-1',
+		completed-steps => [],
+		context         => %(),
+		step-state      => %(
+			s => %(
+				fingerprint => %(
+					count        => 3,
+					keys-sha256  => keys-sha('a', 'b', 'c'),
+					items-sha256 => items-sha('a', 'b', 'c'),
+				),
+				done        => %( a => True ),
+				results     => %( a => 'recovered-a' ),
+				attempts    => %( a => 1 ),
+				dead        => %(),
+				started-at  => '2026-07-19T00:00:00Z',
+			),
+		),
+		updated-at => '2026-07-19T00:00:00Z',
+	);
+	$cp.spurt(to-json(%checkpoint, :sorted-keys));
+
+	my $step = ScriptedItemStep.new(:step-name('s'), :item-list(<a b c>), :content-keys);
+	my $runner = LLM::Data::Pipeline::Runner.new(:degree(2));
+	my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step($step);
+	my $ctx = $runner.resume($plan, $cp);
+
+	is $step.exec-count-for('a'), 0, 'already-done item not re-executed';
+	is $step.exec-count-for('b'), 1, 'pending item b executed';
+	is $step.exec-count-for('c'), 1, 'pending item c executed';
+	is $ctx.get('s/items')<a>, 'recovered-a', 'recovered result preserved verbatim';
+	is $ctx.get('s/items')<b>, 'ok-b', 'pending item produced fresh result';
+};
+
+subtest 'Drift guard: mismatched fingerprint throws CheckpointDrift' => {
+	plan 1;
+	my IO::Path $cp = tmp('drift.checkpoint.json');
+	my %checkpoint = (
+		version         => 2,
+		run-id          => 'lineage-2',
+		completed-steps => [],
+		context         => %(),
+		step-state      => %(
+			s => %(
+				fingerprint => %( count => 3, keys-sha256 => 'totally-wrong-hash' ),
+				done        => %(),
+				results     => %(),
+				attempts    => %(),
+				dead        => %(),
+				started-at  => '2026-07-19T00:00:00Z',
+			),
+		),
+		updated-at => '2026-07-19T00:00:00Z',
+	);
+	$cp.spurt(to-json(%checkpoint, :sorted-keys));
+
+	my $step = ScriptedItemStep.new(:step-name('s'), :item-list(<a b c>), :content-keys);
+	my $runner = LLM::Data::Pipeline::Runner.new(:degree(1));
+	my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step($step);
+	my $err;
+	{ $runner.resume($plan, $cp); CATCH { default { $err = $_ } } }
+	ok $err ~~ X::LLM::Data::Pipeline::CheckpointDrift, 'CheckpointDrift on item-set drift';
+};
+
+subtest 'Drift guard: same keys, different content (index keys) drifts' => {
+	plan 1;
+	my IO::Path $cp = tmp('drift-content.checkpoint.json');
+	# Index keys 0,1,2 (stable), but the items themselves changed value — only
+	# items-sha256 catches this.
+	my %checkpoint = (
+		version         => 2,
+		run-id          => 'lineage-3',
+		completed-steps => [],
+		context         => %(),
+		step-state      => %(
+			s => %(
+				fingerprint => %(
+					count        => 3,
+					keys-sha256  => keys-sha('0', '1', '2'),
+					items-sha256 => items-sha('x', 'y', 'z'),   # original content
+				),
+				done => %(), results => %(), attempts => %(), dead => %(),
+				started-at => '2026-07-19T00:00:00Z',
+			),
+		),
+		updated-at => '2026-07-19T00:00:00Z',
+	);
+	$cp.spurt(to-json(%checkpoint, :sorted-keys));
+
+	# Resume with the SAME index keys but a changed item value at index 2.
+	my $step = ScriptedItemStep.new(:step-name('s'), :item-list(<x y CHANGED>));
+	my $runner = LLM::Data::Pipeline::Runner.new(:degree(1));
+	my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step($step);
+	my $err;
+	{ $runner.resume($plan, $cp); CATCH { default { $err = $_ } } }
+	ok $err ~~ X::LLM::Data::Pipeline::CheckpointDrift,
+		'value-level drift caught even though keys are unchanged';
+};
+
+subtest 'v1 checkpoint compat: completed item step is skipped' => {
+	plan 3;
+	my IO::Path $cp = tmp('v1.checkpoint.json');
+	# Legacy v1 shape: no version, no step-state; reserved key baked into context.
+	my %v1 = (
+		completed-steps => ['s'],
+		context         => %( 's/items' => %( a => 'old-a', b => 'old-b' ), 's/dead' => [] ),
+	);
+	$cp.spurt(to-json(%v1, :sorted-keys));
+
+	my $step = ScriptedItemStep.new(:step-name('s'), :item-list(<a b>), :content-keys);
+	my @events;
+	my $runner = LLM::Data::Pipeline::Runner.new(
+		:degree(1), on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step($step);
+	my $ctx = $runner.resume($plan, $cp);
+
+	is $step.exec-count-for('a'), 0, 'no items re-run for a completed step';
+	ok @events.grep(* ~~ LLM::Data::Pipeline::Event::StepSkipped).elems == 1, 'step skipped';
+	is $ctx.get('s/items')<a>, 'old-a', 'reserved key preserved from v1 context';
+};
+
+subtest 'Kill-simulation: cancel mid-step, resume with a fresh Runner' => {
+	plan 4;
+	my IO::Path $cp = tmp('kill.checkpoint.json');
+
+	# First Runner: cancel after two items complete.
+	my $step1 = ScriptedItemStep.new(:step-name('k'), :item-list(<a b c d e>), :content-keys);
+	my $done = 0;
+	my $r1 = LLM::Data::Pipeline::Runner.new(
+		:degree(1),
+		is-cancelled => -> { $done >= 2 },
+		on-event => -> LLM::Data::Pipeline::Event $e {
+			$done++ if $e ~~ LLM::Data::Pipeline::Event::ItemCompleted;
+		},
+	);
+	my $p1 = LLM::Data::Pipeline::Plan.new; $p1.add-step($step1);
+	my $err;
+	{ $r1.run($p1, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp)); CATCH { default { $err = $_ } } }
+	ok $err ~~ X::LLM::Data::Pipeline::Cancelled, 'first run cancelled';
+	my $processed-first = $step1.executed-keys.elems;
+	ok $processed-first < 5, 'not all items processed before cancel';
+
+	# Second Runner (fresh): resume to completion.
+	my $step2 = ScriptedItemStep.new(:step-name('k'), :item-list(<a b c d e>), :content-keys);
+	my $r2 = LLM::Data::Pipeline::Runner.new(:degree(2));
+	my $p2 = LLM::Data::Pipeline::Plan.new; $p2.add-step($step2);
+	my $ctx = $r2.resume($p2, $cp);
+
+	is $ctx.get('k/items').keys.sort.list.elems, 5, 'all five items present after resume';
+	# The two counters together must cover exactly the 5 items with no double-run
+	# of the items the first run already recorded.
+	ok $step2.executed-keys.elems <= 5 - 0 && $step2.executed-keys.elems >= 5 - $processed-first,
+		'resume re-runs only what the first run had not recorded';
+};
+
+subtest 'Resume of a fully-completed item step is a no-op skip' => {
+	plan 2;
+	my IO::Path $cp = tmp('done.checkpoint.json');
+	my $step1 = ScriptedItemStep.new(:step-name('f'), :item-list(<a b c>), :content-keys);
+	my $r1 = LLM::Data::Pipeline::Runner.new(:degree(2));
+	my $p1 = LLM::Data::Pipeline::Plan.new; $p1.add-step($step1);
+	$r1.run($p1, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+
+	my $step2 = ScriptedItemStep.new(:step-name('f'), :item-list(<a b c>), :content-keys);
+	my $r2 = LLM::Data::Pipeline::Runner.new(:degree(2));
+	my $p2 = LLM::Data::Pipeline::Plan.new; $p2.add-step($step2);
+	my $ctx = $r2.resume($p2, $cp);
+	is $step2.executed-keys.elems, 0, 'no items re-run';
+	is $ctx.get('f/items').keys.elems, 3, 'results carried through resume';
+};
+
+subtest 'run-id lineage is stable across resume' => {
+	plan 2;
+	my IO::Path $cp = tmp('lineage.checkpoint.json');
+	my $step1 = ScriptedItemStep.new(:step-name('g'), :item-list(<a b>), :content-keys);
+	my @ids1;
+	my $r1 = LLM::Data::Pipeline::Runner.new(
+		:degree(1), on-event => -> $e { @ids1.push($e.run-id) },
+	);
+	my $p1 = LLM::Data::Pipeline::Plan.new; $p1.add-step($step1);
+	$r1.run($p1, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+	my $original = @ids1[0];
+
+	my $step2 = ScriptedItemStep.new(:step-name('g'), :item-list(<a b>), :content-keys);
+	my @ids2;
+	my $r2 = LLM::Data::Pipeline::Runner.new(
+		:degree(1), on-event => -> $e { @ids2.push($e.run-id) },
+	);
+	my $p2 = LLM::Data::Pipeline::Plan.new; $p2.add-step($step2);
+	$r2.resume($p2, $cp);
+	is @ids2.unique.elems, 1, 'resume events share one run-id';
+	is @ids2[0], $original, 'resume adopts the checkpoint run-id (stable DLQ lineage)';
+};

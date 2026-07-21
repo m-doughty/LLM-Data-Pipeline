@@ -1,0 +1,77 @@
+use Test;
+use lib 'lib', 't/lib';
+use LLM::Data::Pipeline::Runner;
+use LLM::Data::Pipeline::Plan;
+use LLM::Data::Pipeline::Context;
+use LLM::Data::Pipeline::RetryPolicy;
+use PipelineTestKit;
+use JSONL::Reader;
+
+plan 5;
+
+my IO::Path $tmpdir = $*TMPDIR.add("pipeline-items-stress-{$*PID}");
+$tmpdir.mkdir;
+END { $tmpdir.dir>>.unlink if $tmpdir.d; $tmpdir.rmdir if $tmpdir.d; }
+
+# 200 items, a seeded mix of succeed / flaky / die-always, degree 8, real
+# (ms-scale) timers. We assert only end-state invariants — never event order or
+# timing — so this stays deterministic and Windows-CI-safe.
+constant N = 200;
+
+my $rng = SeededRng.new(:seed(0xC0FFEE));
+my %script;
+my Int $expected-dead = 0;
+for ^N -> $i {
+	my $key = $i.Str;
+	my $roll = $rng.below(10);
+	if $roll < 7 {
+		# succeed (default)
+	}
+	elsif $roll < 9 {
+		%script{$key} = %( kind => 'flaky', fails => 1 + $rng.below(2) );
+	}
+	else {
+		%script{$key} = %( kind => 'die-always' );
+		$expected-dead++;
+	}
+}
+
+my IO::Path $cp = $tmpdir.add('stress.checkpoint.json');
+my $step = ScriptedItemStep.new(
+	:step-name('s'),
+	:item-list((^N).list),
+	:script(%script),
+	:step-item-retry(LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(3), :base-delay(0.001), :jitter(0))),
+);
+my $runner = LLM::Data::Pipeline::Runner.new(:degree(8));
+my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step($step);
+my $ctx = $runner.run($plan, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+
+my $done = $ctx.get('s/items').elems;
+my $dead = $ctx.get('s/dead').elems;
+
+is $done + $dead, N, 'every item is terminal: done + dead == total';
+is $dead, $expected-dead, 'dead set matches the scripted die-always items';
+
+my @dlq = JSONL::Reader.new(:path($tmpdir.add('stress.dlq.jsonl'))).list.map(*.value);
+my @dead-records = @dlq.grep({ .<kind> eq 'dead' });
+# Dedupe by (step, key) last-record — all should still be 'dead'.
+my %last;
+%last{"{.<step>}\0{.<key>}"} = $_ for @dlq;
+my $live-dead = %last.values.grep({ .<kind> eq 'dead' }).elems;
+is $live-dead, $expected-dead, 'DLQ (last-record dedupe) dead count == dead items';
+
+ok @dead-records >= $expected-dead, 'a dead record exists for every dead item';
+
+# No successful item is missing a result; no dead item has a result.
+my $ok = True;
+for ^N -> $i {
+	my $key = $i.Str;
+	my $is-dead = $ctx.get('s/dead').Set{$key}:exists;
+	if $is-dead {
+		$ok = False if $ctx.get('s/items'){$key}:exists;
+	} else {
+		$ok = False unless $ctx.get('s/items'){$key}:exists;
+	}
+}
+ok $ok, 'items and dead sets are disjoint and cover everything';

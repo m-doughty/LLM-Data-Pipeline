@@ -1,0 +1,159 @@
+use Test;
+use lib 'lib', 't/lib';
+use LLM::Data::Pipeline::Runner;
+use LLM::Data::Pipeline::Plan;
+use LLM::Data::Pipeline::Context;
+use LLM::Data::Pipeline::Event;
+use LLM::Data::Pipeline::RetryPolicy;
+use PipelineTestKit;
+use JSON::Fast;
+use JSONL::Reader;
+
+plan 6;
+
+my IO::Path $tmpdir = $*TMPDIR.add("pipeline-items-retry-{$*PID}");
+$tmpdir.mkdir;
+END { $tmpdir.dir>>.unlink if $tmpdir.d; $tmpdir.rmdir if $tmpdir.d; }
+sub tmp(Str:D $n) { $tmpdir.add($n) }
+
+subtest 'Retry-then-succeed — item event train + single completion' => {
+	plan 4;
+	my $step = ScriptedItemStep.new(
+		:step-name('r'), :item-list(<solo>), :content-keys,
+		script => %( solo => %(kind => 'flaky', fails => 2) ),
+		:step-item-retry(LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(3), :base-delay(0), :jitter(0))),
+	);
+	my ($seam, @delays) := instant-timer();
+	my @events;
+	my $r = LLM::Data::Pipeline::Runner.new(
+		:degree(1), schedule-after => $seam,
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my $p = LLM::Data::Pipeline::Plan.new; $p.add-step($step);
+	my $ctx = LLM::Data::Pipeline::Context.new;
+	$r.run($p, $ctx);
+
+	my @item-kinds = @events.grep(* ~~ any(
+		LLM::Data::Pipeline::Event::ItemStarted,
+		LLM::Data::Pipeline::Event::ItemFailed,
+		LLM::Data::Pipeline::Event::ItemCompleted)).map(*.kind);
+	is-deeply @item-kinds, [
+		'item-started', 'item-failed',
+		'item-started', 'item-failed',
+		'item-started', 'item-completed',
+	], 'two failures then a success, in order';
+
+	is $step.exec-count-for('solo'), 3, 'processed exactly three times';
+	is $ctx.get('r/items')<solo>, 'ok-solo', 'final success recorded';
+	is @delays.elems, 2, 'two backoff waits requested';
+};
+
+subtest 'Exhaustion → dead-letter → DLQ record schema' => {
+	plan 12;
+	my IO::Path $cp = tmp('exhaust.checkpoint.json');
+	my $step = ScriptedItemStep.new(
+		:step-name('x'), :item-list(<doomed>), :content-keys,
+		script => %( doomed => %(kind => 'die-always') ),
+		:step-item-retry(LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(2), :base-delay(0), :jitter(0))),
+	);
+	my ($seam, @delays) := instant-timer();
+	my $r = LLM::Data::Pipeline::Runner.new(:degree(1), schedule-after => $seam);
+	my $p = LLM::Data::Pipeline::Plan.new; $p.add-step($step);
+	$r.run($p, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+
+	is $step.exec-count-for('doomed'), 2, 'attempted twice then dead-lettered';
+
+	my IO::Path $dlq = tmp('exhaust.dlq.jsonl');
+	ok $dlq.e, 'DLQ file written';
+	my @records = JSONL::Reader.new(:path($dlq)).list.map(*.value);
+	is @records.elems, 1, 'exactly one DLQ record';
+	my %rec = @records[0];
+	is %rec<schema>, 1, 'schema 1';
+	is %rec<kind>, 'dead', 'kind dead';
+	is %rec<step>, 'x', 'step name';
+	is %rec<key>, 'doomed', 'item key';
+	ok %rec<item-digest>.chars == 64, 'item-digest is a sha256 hex';
+	is %rec<attempts>, 2, 'attempts count';
+	is %rec<attempt-history>.elems, 2, 'attempt-history has one entry per attempt';
+	is %rec<error><message>, 'die-always: doomed', 'error message captured';
+
+	my %ck = from-json($cp.slurp);
+	ok %ck<step-state><x><dead><doomed>, 'checkpoint marks the item dead';
+};
+
+subtest 'Dead item does not fail the run by default' => {
+	plan 2;
+	my $step = ScriptedItemStep.new(
+		:step-name('d'), :item-list(<a b>), :content-keys,
+		script => %( b => %(kind => 'die-always') ),
+		:step-item-retry(LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(1))),
+	);
+	my $r = LLM::Data::Pipeline::Runner.new(:degree(1));
+	my $p = LLM::Data::Pipeline::Plan.new; $p.add-step($step);
+	my $ctx = LLM::Data::Pipeline::Context.new;
+	lives-ok { $r.run($p, $ctx) }, 'run completes despite a dead item';
+	is-deeply $ctx.get('d/dead').List, ('b',), 'dead item journaled';
+};
+
+subtest 'fail-on-dead throws ItemsDead after the step is checkpointed' => {
+	plan 4;
+	use LLM::Data::Pipeline::Exceptions;
+	my IO::Path $cp = tmp('faildead.checkpoint.json');
+	my $step = ScriptedItemStep.new(
+		:step-name('fd'), :item-list(<a b>), :content-keys,
+		:fails-on-dead,
+		script => %( b => %(kind => 'die-always') ),
+		:step-item-retry(LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(1))),
+	);
+	my $r = LLM::Data::Pipeline::Runner.new(:degree(1));
+	my $p = LLM::Data::Pipeline::Plan.new; $p.add-step($step);
+	my $err;
+	{
+		$r.run($p, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+		CATCH { default { $err = $_ } }
+	}
+	ok $err ~~ X::LLM::Data::Pipeline::ItemsDead, 'ItemsDead thrown';
+	is-deeply $err.dead-keys.sort.list, ('b',), 'carries the dead keys';
+	my %ck = from-json($cp.slurp);
+	ok 'fd' (elem) %ck<completed-steps>.Set, 'step recorded complete before the throw';
+	ok %ck<step-state><fd><dead><b>, 'dead state persisted';
+};
+
+subtest 'Duplicate item keys abort at activation' => {
+	plan 1;
+	my $step = ScriptedItemStep.new(
+		:step-name('dup'), :item-list(<same same other>), :content-keys,
+	);
+	my $r = LLM::Data::Pipeline::Runner.new(:degree(1));
+	my $p = LLM::Data::Pipeline::Plan.new; $p.add-step($step);
+	dies-ok { $r.run($p, LLM::Data::Pipeline::Context.new) },
+		'duplicate item-key dies';
+};
+
+subtest 'Frozen-Context violation surfaces as an item failure' => {
+	plan 2;
+	# A step whose process-item illegally mutates the frozen Context.
+	my class MutatingStep does LLM::Data::Pipeline::Step::Items {
+		method name(--> Str:D) { 'mut' }
+		method description(--> Str:D) { 'mutates ctx' }
+		method provides(--> List) { ('mut/items',) }
+		method items($ctx --> Iterable) { <a>.list }
+		method item-key(Int:D $i, $item --> Str:D) { $item }
+		method process-item($ctx, $item, Str:D $key --> Any) {
+			$ctx.set('sneaky', 1);   # illegal while frozen
+			'never';
+		}
+	}
+	my @events;
+	my $r = LLM::Data::Pipeline::Runner.new(
+		:degree(1),
+		item-retry => LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(1)),
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my $p = LLM::Data::Pipeline::Plan.new; $p.add-step(MutatingStep.new);
+	my $ctx = LLM::Data::Pipeline::Context.new;
+	$r.run($p, $ctx);
+	my $failed = @events.first(* ~~ LLM::Data::Pipeline::Event::ItemFailed);
+	ok $failed.defined, 'the illegal mutation became an item failure';
+	like $failed.error, /frozen/, 'error explains the Context was frozen';
+};

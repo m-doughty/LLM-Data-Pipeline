@@ -2,7 +2,7 @@ use Test;
 use lib 'lib';
 use LLM::Data::Pipeline::Context;
 
-plan 12;
+plan 15;
 
 subtest 'Empty context has no keys' => {
 	plan 2;
@@ -117,4 +117,39 @@ subtest 'Multiple set/get operations' => {
 	}
 	is $ctx.keys.elems, 100, '100 keys stored';
 	is $ctx.get('key-50'), 50, 'Random access correct';
+};
+
+subtest 'freeze blocks set, thaw restores it' => {
+	plan 5;
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	$ctx.set('before', 1);
+	nok $ctx.frozen, 'Starts unfrozen';
+	$ctx.freeze;
+	ok $ctx.frozen, 'freeze sets the flag';
+	dies-ok { $ctx.set('during', 2) }, 'set dies while frozen';
+	$ctx.thaw;
+	nok $ctx.frozen, 'thaw clears the flag';
+	lives-ok { $ctx.set('after', 3) }, 'set works again after thaw';
+};
+
+subtest 'reads are allowed while frozen' => {
+	plan 3;
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	$ctx.set('k', 'v');
+	$ctx.freeze;
+	is $ctx.get('k'), 'v', 'get works while frozen';
+	ok $ctx.has('k'), 'has works while frozen';
+	is $ctx.keys.elems, 1, 'keys works while frozen';
+};
+
+subtest 'snapshot/from-snapshot ignore the frozen flag' => {
+	plan 2;
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	$ctx.set('k', 'v');
+	$ctx.freeze;
+	my %snap = $ctx.snapshot;
+	is %snap<k>, 'v', 'snapshot works while frozen';
+	my LLM::Data::Pipeline::Context $restored =
+		LLM::Data::Pipeline::Context.from-snapshot(%snap);
+	nok $restored.frozen, 'restored context is not frozen';
 };

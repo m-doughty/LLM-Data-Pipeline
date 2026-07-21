@@ -6,7 +6,9 @@
   "build-depends": [
   ],
   "depends": [
-    "JSON::Fast:ver<0.19>:auth<cpan:TIMOTIMO>"
+    "JSON::Fast:ver<0.19>:auth<cpan:TIMOTIMO>",
+    "JSONL:auth<zef:apogee>",
+    "Digest::SHA256::Native"
   ],
   "description": "Generic pipeline framework for composing and running sequential data processing steps with checkpointing",
   "license": "Artistic-2.0",
@@ -15,9 +17,13 @@
   "provides": {
     "LLM::Data::Pipeline": "lib/LLM/Data/Pipeline.rakumod",
     "LLM::Data::Pipeline::Context": "lib/LLM/Data/Pipeline/Context.rakumod",
+    "LLM::Data::Pipeline::Event": "lib/LLM/Data/Pipeline/Event.rakumod",
+    "LLM::Data::Pipeline::Exceptions": "lib/LLM/Data/Pipeline/Exceptions.rakumod",
     "LLM::Data::Pipeline::Plan": "lib/LLM/Data/Pipeline/Plan.rakumod",
+    "LLM::Data::Pipeline::RetryPolicy": "lib/LLM/Data/Pipeline/RetryPolicy.rakumod",
     "LLM::Data::Pipeline::Runner": "lib/LLM/Data/Pipeline/Runner.rakumod",
-    "LLM::Data::Pipeline::Step": "lib/LLM/Data/Pipeline/Step.rakumod"
+    "LLM::Data::Pipeline::Step": "lib/LLM/Data/Pipeline/Step.rakumod",
+    "LLM::Data::Pipeline::Step::Items": "lib/LLM/Data/Pipeline/Step/Items.rakumod"
   },
   "resources": [
   ],
@@ -29,5 +35,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.1.1"
+  "version": "0.5.0"
 }

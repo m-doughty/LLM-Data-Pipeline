@@ -1,0 +1,155 @@
+use Test;
+use lib 'lib', 't/lib';
+use LLM::Data::Pipeline::Runner;
+use LLM::Data::Pipeline::Plan;
+use LLM::Data::Pipeline::Context;
+use LLM::Data::Pipeline::Step;
+use LLM::Data::Pipeline::Event;
+use LLM::Data::Pipeline::Exceptions;
+use LLM::Data::Pipeline::RetryPolicy;
+use PipelineTestKit;
+use JSONL::Reader;
+use JSONL::Writer;
+
+plan 4;
+
+my IO::Path $tmpdir = $*TMPDIR.add("pipeline-items-retrydead-{$*PID}");
+$tmpdir.mkdir;
+END { $tmpdir.dir>>.unlink if $tmpdir.d; $tmpdir.rmdir if $tmpdir.d; }
+sub tmp(Str:D $n) { $tmpdir.add($n) }
+
+# A plain downstream step that concatenates the upstream item keys — so we can
+# prove it re-ran after its upstream was reopened by :retry-dead.
+class ConcatStep does LLM::Data::Pipeline::Step {
+	has Str:D $.step-name is required;
+	has Str:D $.in-key is required;
+	has Str:D $.out-key is required;
+	method name(--> Str:D) { $!step-name }
+	method description(--> Str:D) { "concat $!in-key" }
+	method requires(--> List) { ($!in-key,) }
+	method provides(--> List) { ($!out-key,) }
+	method execute(LLM::Data::Pipeline::Context:D $ctx --> Nil) {
+		$ctx.set($!out-key, $ctx.get($!in-key).keys.sort.join(','));
+	}
+}
+
+subtest 'retry-dead requeues, reopens completed step, invalidates downstream' => {
+	plan 6;
+	my IO::Path $cp = tmp('rd.checkpoint.json');
+
+	# First run: item 'z' dies permanently; step A completes with z dead; B runs.
+	my $a1 = ScriptedItemStep.new(
+		:step-name('A'), :item-list(<x y z>), :content-keys,
+		:provides-list(('A/items',)),
+		script => %( z => %(kind => 'die-always') ),
+		:step-item-retry(LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(1))),
+	);
+	my $r1 = LLM::Data::Pipeline::Runner.new(:degree(2));
+	my $p1 = LLM::Data::Pipeline::Plan.new;
+	$p1.add-step($a1);
+	$p1.add-step(ConcatStep.new(:step-name('B'), :in-key('A/items'), :out-key('B-out')));
+	my $ctx1 = $r1.run($p1, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+	is $ctx1.get('B-out'), 'x,y', 'first run: B sees only the live items';
+
+	# Resume with :retry-dead — this time z succeeds.
+	my $a2 = ScriptedItemStep.new(
+		:step-name('A'), :item-list(<x y z>), :content-keys,
+		:provides-list(('A/items',)),
+		script => %(),   # all succeed now
+	);
+	my @events;
+	my $r2 = LLM::Data::Pipeline::Runner.new(
+		:degree(2), on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my $p2 = LLM::Data::Pipeline::Plan.new;
+	$p2.add-step($a2);
+	$p2.add-step(ConcatStep.new(:step-name('B'), :in-key('A/items'), :out-key('B-out')));
+	my $ctx2 = $r2.resume($p2, $cp, :retry-dead);
+
+	is $a2.exec-count-for('z'), 1, 'only the formerly-dead item re-ran';
+	is $a2.exec-count-for('x'), 0, 'already-live items were NOT re-run';
+	is $ctx2.get('A/items').keys.sort.join(','), 'x,y,z', 'z now recorded live';
+	is $ctx2.get('B-out'), 'x,y,z', 'downstream B re-ran with the reopened upstream';
+	ok @events.grep(* ~~ LLM::Data::Pipeline::Event::ItemRequeued).elems == 1,
+		'item-requeued emitted for the reopened item';
+};
+
+subtest 'retry-dead appends a requeued DLQ record' => {
+	plan 2;
+	my IO::Path $cp = tmp('rd2.checkpoint.json');
+	my $a1 = ScriptedItemStep.new(
+		:step-name('A'), :item-list(<p q>), :content-keys,
+		script => %( q => %(kind => 'die-always') ),
+		:step-item-retry(LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(1))),
+	);
+	my $r1 = LLM::Data::Pipeline::Runner.new(:degree(1));
+	my $p1 = LLM::Data::Pipeline::Plan.new; $p1.add-step($a1);
+	$r1.run($p1, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+
+	my $a2 = ScriptedItemStep.new(:step-name('A'), :item-list(<p q>), :content-keys);
+	my $r2 = LLM::Data::Pipeline::Runner.new(:degree(1));
+	my $p2 = LLM::Data::Pipeline::Plan.new; $p2.add-step($a2);
+	$r2.resume($p2, $cp, :retry-dead);
+
+	my @records = JSONL::Reader.new(:path(tmp('rd2.dlq.jsonl'))).list.map(*.value);
+	# Dedupe by last record per (step, key): q should now be 'requeued'.
+	my %last;
+	%last{"{.<step>}\0{.<key>}"} = $_ for @records;
+	is %last{"A\0q"}<kind>, 'requeued', 'last journal record for q is requeued';
+	ok @records.grep({ .<kind> eq 'dead' }).elems >= 1, 'original dead record retained';
+};
+
+subtest 'retry-dead digest drift throws CheckpointDrift' => {
+	plan 1;
+	my IO::Path $cp = tmp('rd3.checkpoint.json');
+	# Index keys so the item content can change while the key (index) stays.
+	my $a1 = ScriptedItemStep.new(
+		:step-name('A'), :item-list(<good1 good2 BAD>),   # index 2 = 'BAD'
+		script => %( '2' => %(kind => 'die-always') ),
+		:step-item-retry(LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(1))),
+	);
+	my $r1 = LLM::Data::Pipeline::Runner.new(:degree(1));
+	my $p1 = LLM::Data::Pipeline::Plan.new; $p1.add-step($a1);
+	$r1.run($p1, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+
+	# Resume with a DIFFERENT item at index 2 → digest mismatch.
+	my $a2 = ScriptedItemStep.new(:step-name('A'), :item-list(<good1 good2 CHANGED>));
+	my $r2 = LLM::Data::Pipeline::Runner.new(:degree(1));
+	my $p2 = LLM::Data::Pipeline::Plan.new; $p2.add-step($a2);
+	my $err;
+	{ $r2.resume($p2, $cp, :retry-dead); CATCH { default { $err = $_ } } }
+	ok $err ~~ X::LLM::Data::Pipeline::CheckpointDrift, 'digest drift caught on retry-dead';
+};
+
+subtest 'retry-dead still verifies against the last DEAD record (crash-window)' => {
+	plan 1;
+	my IO::Path $cp = tmp('rd4.checkpoint.json');
+	# First run: index 1 ('BAD') dies → dead record with digest of "BAD".
+	my $a1 = ScriptedItemStep.new(
+		:step-name('A'), :item-list(<ok BAD>),
+		script => %( '1' => %(kind => 'die-always') ),
+		:step-item-retry(LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(1))),
+	);
+	my $r1 = LLM::Data::Pipeline::Runner.new(:degree(1));
+	my $p1 = LLM::Data::Pipeline::Plan.new; $p1.add-step($a1);
+	$r1.run($p1, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+
+	# Simulate a crash mid retry-dead: a 'requeued' record was appended to the DLQ
+	# but the checkpoint was NOT updated (item 1 is still marked dead). The last
+	# record for (A,1) is now 'requeued'.
+	my IO::Path $dlq = tmp('rd4.dlq.jsonl');
+	JSONL::Writer.new(:path($dlq)).append(%(
+		schema => 1, kind => 'requeued', step => 'A', key => '1',
+		'item-digest' => 'stale', attempts => 0,
+	));
+
+	# Resume :retry-dead again with a CHANGED item at index 1. The guard must still
+	# verify against the DEAD record's digest (not the trailing 'requeued') → drift.
+	my $a2 = ScriptedItemStep.new(:step-name('A'), :item-list(<ok CHANGED>));
+	my $r2 = LLM::Data::Pipeline::Runner.new(:degree(1));
+	my $p2 = LLM::Data::Pipeline::Plan.new; $p2.add-step($a2);
+	my $err;
+	{ $r2.resume($p2, $cp, :retry-dead); CATCH { default { $err = $_ } } }
+	ok $err ~~ X::LLM::Data::Pipeline::CheckpointDrift,
+		'digest verified against the last DEAD record despite a trailing requeued';
+};

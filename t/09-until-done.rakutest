@@ -1,0 +1,218 @@
+use Test;
+use lib 'lib', 't/lib';
+use LLM::Data::Pipeline::Runner;
+use LLM::Data::Pipeline::Plan;
+use LLM::Data::Pipeline::Context;
+use LLM::Data::Pipeline::Step;
+use LLM::Data::Pipeline::Event;
+use LLM::Data::Pipeline::Exceptions;
+use LLM::Data::Pipeline::RetryPolicy;
+use PipelineTestKit;
+use JSON::Fast;
+
+plan 8;
+
+my IO::Path $tmpdir = $*TMPDIR.add("pipeline-until-done-{$*PID}");
+$tmpdir.mkdir;
+END { $tmpdir.dir>>.unlink if $tmpdir.d; $tmpdir.rmdir if $tmpdir.d; }
+sub tmp(Str:D $n) { $tmpdir.add($n) }
+
+sub retries-of(@events) {
+	@events.grep(* ~~ LLM::Data::Pipeline::Event::RunRetry).list;
+}
+
+subtest 'Fail attempts 1-2 then succeed: two run-retries, exact backoff, no re-exec' => {
+	plan 6;
+	my IO::Path $cp = tmp('happy.checkpoint.json');
+	my $a = ScriptedItemStep.new(
+		:step-name('a'), :item-list(<x y z>), :content-keys, :provides-list(('a/items',)),
+	);
+	my $b = FlakyPlainStep.new(:step-name('b'), :fails(2), :requires-list(('a/items',)));
+	my @delays;
+	my @events;
+	my $r = LLM::Data::Pipeline::Runner.new(
+		schedule-after => -> Real $s, &cb { @delays.push($s); cb(Promise.kept); Promise.kept },
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step($a); $plan.add-step($b);
+	my $result = $r.run-until-done(
+		$plan, LLM::Data::Pipeline::Context.new,
+		:checkpoint-path($cp),
+		:run-retry(LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(5), :base-delay(2), :jitter(0))),
+	);
+
+	is $result.get('b-out'), 'ok-3', 'step b succeeded on its third execution';
+	is $a.executed-keys.elems, 3, 'item step a ran its items exactly once (attempt 1 only)';
+	my @rt = retries-of(@events);
+	is @rt.elems, 2, 'two run-retry events';
+	is @delays.join(','), '2,4', 'exact backoff schedule 2, 4';
+	is-deeply @rt.map(*.attempt).List, (1, 2), 'run-retry attempts are the failed attempts';
+	is-deeply @rt.map(*.seq).List, (0, 0), 'run-retry events sit outside a run sequence (seq 0)';
+};
+
+subtest 'run-retry carries the lineage run-id and full cause' => {
+	plan 3;
+	my IO::Path $cp = tmp('cause.checkpoint.json');
+	my $b = FlakyPlainStep.new(:step-name('b'), :fails(1));
+	my @events;
+	my $r = LLM::Data::Pipeline::Runner.new(
+		schedule-after => -> Real $s, &cb { cb(Promise.kept); Promise.kept },
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step($b);
+	$r.run-until-done($plan, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp),
+		:run-retry(LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(3), :base-delay(1), :jitter(0))));
+
+	my $rt = retries-of(@events)[0];
+	is $rt.max-attempts, 3, 'run-retry carries the budget';
+	like $rt.error, /'b fails'/, 'run-retry carries the failure message';
+	# The lineage run-id is the checkpoint's — the same one the run/resume events used.
+	my $lineage = @events.first(* ~~ LLM::Data::Pipeline::Event::RunStarted).run-id;
+	is $rt.run-id, $lineage, 'run-retry uses the lineage run-id';
+};
+
+subtest 'Budget exhaustion rethrows the last error unchanged' => {
+	plan 3;
+	my IO::Path $cp = tmp('exhaust.checkpoint.json');
+	my $b = FlakyPlainStep.new(:step-name('b'), :fails(99));   # never succeeds
+	my @events;
+	my $r = LLM::Data::Pipeline::Runner.new(
+		schedule-after => -> Real $s, &cb { cb(Promise.kept); Promise.kept },
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step($b);
+	my $err;
+	{
+		$r.run-until-done($plan, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp),
+			:run-retry(LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(3), :base-delay(1), :jitter(0))));
+		CATCH { default { $err = $_ } }
+	}
+	ok $err.defined, 'run-until-done threw once the budget was spent';
+	like $err.message, /'b fails'/, 'the original last error is rethrown unchanged';
+	is retries-of(@events).elems, 2, 'max-attempts 3 ⇒ 2 run-retries before giving up';
+};
+
+subtest 'Plan-validation failure is not retried' => {
+	plan 2;
+	my IO::Path $cp = tmp('validate.checkpoint.json');
+	# Step requires a key nothing provides ⇒ validation fails.
+	my $b = FlakyPlainStep.new(:step-name('b'), :fails(0), :requires-list(('missing',)));
+	my @events;
+	my $r = LLM::Data::Pipeline::Runner.new(
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step($b);
+	my $err;
+	{
+		$r.run-until-done($plan, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+		CATCH { default { $err = $_ } }
+	}
+	ok $err.defined, 'validation failure propagated';
+	is retries-of(@events).elems, 0, 'no run-retry for a malformed plan';
+};
+
+subtest 'CheckpointDrift is not retried' => {
+	plan 2;
+	my IO::Path $cp = tmp('drift.checkpoint.json');
+	# A pre-existing checkpoint whose fingerprint cannot match ⇒ attempt 1 resumes
+	# and drifts immediately.
+	$cp.spurt(to-json(%(
+		version => 2, run-id => 'lin', completed-steps => [], context => %(),
+		step-state => %( a => %(
+			fingerprint => %( count => 2, keys-sha256 => 'nope', items-sha256 => 'nope' ),
+			done => %(), results => %(), attempts => %(), dead => %(), started-at => 't',
+		) ),
+		updated-at => 't',
+	)));
+	my $a = ScriptedItemStep.new(:step-name('a'), :item-list(<x y>), :content-keys, :provides-list(('a/items',)));
+	my @events;
+	my $r = LLM::Data::Pipeline::Runner.new(
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step($a);
+	my $err;
+	{
+		$r.run-until-done($plan, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+		CATCH { default { $err = $_ } }
+	}
+	ok $err ~~ X::LLM::Data::Pipeline::CheckpointDrift, 'CheckpointDrift rethrown immediately';
+	is retries-of(@events).elems, 0, 'no run-retry for drift';
+};
+
+subtest 'Cancellation is not retried' => {
+	plan 2;
+	my IO::Path $cp = tmp('cancel.checkpoint.json');
+	my $a = ScriptedItemStep.new(:step-name('a'), :item-list(<x y z w>), :content-keys, :provides-list(('a/items',)));
+	my $done = 0;
+	my @events;
+	my $r = LLM::Data::Pipeline::Runner.new(
+		:degree(1),
+		is-cancelled => -> { $done >= 1 },
+		on-event => -> LLM::Data::Pipeline::Event $e {
+			@events.push($e);
+			$done++ if $e ~~ LLM::Data::Pipeline::Event::ItemCompleted;
+		},
+	);
+	my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step($a);
+	my $err;
+	{
+		$r.run-until-done($plan, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+		CATCH { default { $err = $_ } }
+	}
+	ok $err ~~ X::LLM::Data::Pipeline::Cancelled, 'Cancelled rethrown immediately';
+	is retries-of(@events).elems, 0, 'no run-retry for cancellation';
+};
+
+subtest 'ItemsDead is immediate-rethrow WITHOUT :retry-dead' => {
+	plan 2;
+	my IO::Path $cp = tmp('itemsdead.checkpoint.json');
+	my $a = ScriptedItemStep.new(
+		:step-name('a'), :item-list(<x y>), :content-keys, :fails-on-dead,
+		script => %( y => %(kind => 'die-always') ),
+		:step-item-retry(LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(1))),
+	);
+	my @events;
+	my $r = LLM::Data::Pipeline::Runner.new(
+		schedule-after => -> Real $s, &cb { cb(Promise.kept); Promise.kept },
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step($a);
+	my $err;
+	{
+		$r.run-until-done($plan, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp),
+			:run-retry(LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(5), :base-delay(1), :jitter(0))));
+		CATCH { default { $err = $_ } }
+	}
+	ok $err ~~ X::LLM::Data::Pipeline::ItemsDead, 'ItemsDead rethrown immediately (retrying is futile)';
+	is retries-of(@events).elems, 0, 'no run-retry for dead items without :retry-dead';
+};
+
+subtest ':retry-dead composition — dead in attempt 1, requeued and succeeds in attempt 2' => {
+	plan 4;
+	my IO::Path $cp = tmp('retrydead.checkpoint.json');
+	# Item 'y' fails its first execution (dead-lettered in attempt 1), then succeeds
+	# when requeued in attempt 2. fail-on-dead makes attempt 1 throw ItemsDead.
+	my $a = ScriptedItemStep.new(
+		:step-name('a'), :item-list(<x y>), :content-keys, :fails-on-dead,
+		:provides-list(('a/items',)),
+		script => %( y => %(kind => 'flaky', fails => 1) ),
+		:step-item-retry(LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(1))),
+	);
+	my @events;
+	my $r = LLM::Data::Pipeline::Runner.new(
+		:degree(1),
+		schedule-after => -> Real $s, &cb { cb(Promise.kept); Promise.kept },
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step($a);
+	my $result = $r.run-until-done(
+		$plan, LLM::Data::Pipeline::Context.new,
+		:checkpoint-path($cp), :retry-dead,
+		:run-retry(LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(5), :base-delay(1), :jitter(0))),
+	);
+
+	is $result.get('a/items').keys.sort.list.elems, 2, 'both items present after retry-dead resume';
+	is $result.get('a/items')<y>, 'ok-y', 'the requeued item eventually succeeded';
+	is $result.get('a/dead').elems, 0, 'no dead items remain';
+	is retries-of(@events).elems, 1, 'one run-retry (the ItemsDead from attempt 1)';
+};

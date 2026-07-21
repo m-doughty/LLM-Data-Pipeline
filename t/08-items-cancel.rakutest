@@ -1,0 +1,156 @@
+use Test;
+use lib 'lib', 't/lib';
+use LLM::Data::Pipeline::Runner;
+use LLM::Data::Pipeline::Plan;
+use LLM::Data::Pipeline::Context;
+use LLM::Data::Pipeline::Event;
+use LLM::Data::Pipeline::Exceptions;
+use LLM::Data::Pipeline::RetryPolicy;
+use PipelineTestKit;
+use JSON::Fast;
+
+plan 5;
+
+my IO::Path $tmpdir = $*TMPDIR.add("pipeline-items-cancel-{$*PID}");
+$tmpdir.mkdir;
+END { $tmpdir.dir>>.unlink if $tmpdir.d; $tmpdir.rmdir if $tmpdir.d; }
+sub tmp(Str:D $n) { $tmpdir.add($n) }
+
+subtest 'Cancellation: RunCancelled event + Cancelled exception + checkpoint' => {
+	plan 6;
+	my IO::Path $cp = tmp('c.checkpoint.json');
+	my $step = ScriptedItemStep.new(:step-name('c'), :item-list(<a b c d e f>), :content-keys);
+	my $done = 0;
+	my @events;
+	my $r = LLM::Data::Pipeline::Runner.new(
+		:degree(1),
+		is-cancelled => -> { $done >= 2 },
+		on-event => -> LLM::Data::Pipeline::Event $e {
+			@events.push($e);
+			$done++ if $e ~~ LLM::Data::Pipeline::Event::ItemCompleted;
+		},
+	);
+	my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step($step);
+	my $err;
+	{ $r.run($plan, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp)); CATCH { default { $err = $_ } } }
+
+	ok $err ~~ X::LLM::Data::Pipeline::Cancelled, 'Cancelled thrown';
+	is $err.step, 'c', 'exception carries the active step';
+
+	my $rc = @events.first(* ~~ LLM::Data::Pipeline::Event::RunCancelled);
+	ok $rc.defined, 'run-cancelled emitted';
+	my $completed-count = @events.grep(* ~~ LLM::Data::Pipeline::Event::ItemCompleted).elems;
+	is $rc.items-done, $completed-count, 'run-cancelled items-done matches completed items';
+
+	my %ck = from-json($cp.slurp);
+	nok 'c' (elem) %ck<completed-steps>.Set, 'cancelled step is NOT marked completed';
+	is %ck<step-state><c><done>.elems, $completed-count, 'checkpoint records the drained results';
+};
+
+subtest 'No run-completed / step-completed after cancellation' => {
+	plan 2;
+	my $step = ScriptedItemStep.new(:step-name('c2'), :item-list(<a b c d>), :content-keys);
+	my $done = 0;
+	my @kinds;
+	my $r = LLM::Data::Pipeline::Runner.new(
+		:degree(1),
+		is-cancelled => -> { $done >= 1 },
+		on-event => -> LLM::Data::Pipeline::Event $e {
+			@kinds.push($e.kind);
+			$done++ if $e ~~ LLM::Data::Pipeline::Event::ItemCompleted;
+		},
+	);
+	my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step($step);
+	{ $r.run($plan, LLM::Data::Pipeline::Context.new); CATCH { default {} } }
+	nok @kinds.grep(* eq 'step-completed').elems, 'no step-completed after cancel';
+	nok @kinds.grep(* eq 'run-completed').elems, 'no run-completed after cancel';
+};
+
+subtest 'Cancel-then-resume loses no completed work' => {
+	plan 2;
+	my IO::Path $cp = tmp('c3.checkpoint.json');
+	my $s1 = ScriptedItemStep.new(:step-name('c3'), :item-list(<a b c d e f g h>), :content-keys);
+	my $done = 0;
+	my $r1 = LLM::Data::Pipeline::Runner.new(
+		:degree(1),
+		is-cancelled => -> { $done >= 3 },
+		on-event => -> LLM::Data::Pipeline::Event $e {
+			$done++ if $e ~~ LLM::Data::Pipeline::Event::ItemCompleted;
+		},
+	);
+	my $p1 = LLM::Data::Pipeline::Plan.new; $p1.add-step($s1);
+	{ $r1.run($p1, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp)); CATCH { default {} } }
+	my $first-exec = $s1.executed-keys.elems;
+
+	my $s2 = ScriptedItemStep.new(:step-name('c3'), :item-list(<a b c d e f g h>), :content-keys);
+	my $r2 = LLM::Data::Pipeline::Runner.new(:degree(4));
+	my $p2 = LLM::Data::Pipeline::Plan.new; $p2.add-step($s2);
+	my $ctx = $r2.resume($p2, $cp);
+
+	is $ctx.get('c3/items').keys.sort.list.elems, 8, 'all items present after resume';
+	ok $s2.executed-keys.elems <= 8 - 3 + 1,
+		'resume re-ran at most the abandoned items (recorded ones skipped)';
+};
+
+subtest 'Cancelled run emits run-cancelled and NOT run-failed (single terminal)' => {
+	plan 3;
+	my $step = ScriptedItemStep.new(:step-name('c4'), :item-list(<a b c d>), :content-keys);
+	my $done = 0;
+	my @kinds;
+	my $r = LLM::Data::Pipeline::Runner.new(
+		:degree(1),
+		is-cancelled => -> { $done >= 1 },
+		on-event => -> LLM::Data::Pipeline::Event $e {
+			@kinds.push($e.kind);
+			$done++ if $e ~~ LLM::Data::Pipeline::Event::ItemCompleted;
+		},
+	);
+	my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step($step);
+	{ $r.run($plan, LLM::Data::Pipeline::Context.new); CATCH { default {} } }
+	is @kinds.grep(* eq 'run-cancelled').elems, 1, 'exactly one run-cancelled';
+	is @kinds.grep(* eq 'run-failed').elems, 0, 'no run-failed for a cancellation';
+	is @kinds.grep(* eq 'run-completed').elems, 0, 'no run-completed either';
+};
+
+subtest 'Cancel while an item is in backoff does not dispatch the retry' => {
+	plan 4;
+	my IO::Path $cp = tmp('backoff.checkpoint.json');
+	# A capturing timer that stores the retry callback WITHOUT firing it — the
+	# item stays parked in backoff until we fire it by hand.
+	my @cbs;
+	my Bool $cancel-now = False;
+	my Promise $failed .= new;
+	my $step = ScriptedItemStep.new(
+		:step-name('bo'), :item-list(<solo>), :content-keys,
+		script => %( solo => %(kind => 'flaky', fails => 1) ),   # would succeed on retry
+		:step-item-retry(LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(3), :base-delay(1), :jitter(0))),
+	);
+	my $r = LLM::Data::Pipeline::Runner.new(
+		:degree(1),
+		schedule-after => -> Real $s, &cb { @cbs.push(&cb); Promise.kept },
+		is-cancelled => -> { $cancel-now },
+		on-event => -> LLM::Data::Pipeline::Event $e {
+			$failed.keep if $e ~~ LLM::Data::Pipeline::Event::ItemFailed && $failed.status !~~ Kept;
+		},
+	);
+	my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step($step);
+	my $ctx = LLM::Data::Pipeline::Context.new;
+
+	my $run = start {
+		my $err;
+		{ $r.run($plan, $ctx, :checkpoint-path($cp)); CATCH { default { $err = $_ } } }
+		$err;
+	};
+	await Promise.anyof($failed, Promise.in(15));   # item has failed → parked in backoff
+	$cancel-now = True;                              # request cancel during backoff
+	@cbs[0].(Promise.kept);                          # timer fires → wake-retry arrives
+	await Promise.anyof($run, Promise.in(15));
+
+	ok $run.status ~~ Kept, 'run finished (no hang)';
+	ok (await $run) ~~ X::LLM::Data::Pipeline::Cancelled, 'threw Cancelled';
+	is $step.exec-count-for('solo'), 1, 'the retry was NOT dispatched (only the initial attempt ran)';
+
+	my %ck = from-json($cp.slurp);
+	nok (%ck<step-state><bo><done><solo>:exists) || (%ck<step-state><bo><dead><solo>:exists),
+		'item left pending (neither done nor dead) for a clean resume';
+};

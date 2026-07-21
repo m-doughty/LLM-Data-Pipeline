@@ -1,0 +1,161 @@
+use Test;
+use lib 'lib', 't/lib';
+use LLM::Data::Pipeline::Runner;
+use LLM::Data::Pipeline::Plan;
+use LLM::Data::Pipeline::Context;
+use LLM::Data::Pipeline::Step;
+use LLM::Data::Pipeline::Step::Items;
+use LLM::Data::Pipeline::Event;
+use PipelineTestKit;
+
+plan 8;
+
+sub run-step(ScriptedItemStep $step, :$degree = 4, :@extra-steps, :$ctx = LLM::Data::Pipeline::Context.new) {
+	my @events;
+	my $runner = LLM::Data::Pipeline::Runner.new(
+		:$degree,
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my $plan = LLM::Data::Pipeline::Plan.new;
+	$plan.add-step($_) for @extra-steps;
+	$plan.add-step($step);
+	$runner.run($plan, $ctx);
+	($ctx, @events);
+}
+
+subtest 'Happy path (index keys) — results, reserved keys, finalize' => {
+	plan 5;
+	my $step = ScriptedItemStep.new(
+		:step-name('dbl'),
+		:item-list((10, 20, 30)),
+		:provides-list(('dbl/items', 'total')),
+		finalizer => -> $ctx {
+			$ctx.set('total', $ctx.get('dbl/items').values.map(*.subst('ok-','').Int).sum);
+		},
+		script => %(),   # all succeed
+	);
+	my ($ctx, @events) := run-step($step, :degree(1));
+
+	my %items = $ctx.get('dbl/items');
+	is %items.elems, 3, 'three item results recorded';
+	is %items<0>, 'ok-0', 'result keyed by index';
+	is $ctx.get('dbl/dead').elems, 0, 'no dead items';
+	is-deeply $step.executed-keys, ('0', '1', '2'), 'every item processed exactly once';
+	is $step.exec-count-for('1'), 1, 'each item ran exactly once';
+};
+
+subtest 'Content keys' => {
+	plan 2;
+	my $step = ScriptedItemStep.new(
+		:step-name('c'),
+		:item-list(<alpha beta gamma>),
+		:content-keys,
+	);
+	my ($ctx, @events) := run-step($step, :degree(2));
+	my %items = $ctx.get('c/items');
+	is-deeply %items.keys.sort.list, ('alpha', 'beta', 'gamma'), 'keyed by content';
+	is %items<beta>, 'ok-beta', 'content-keyed result present';
+};
+
+subtest 'Reserved dead key is a sorted list' => {
+	plan 2;
+	my $step = ScriptedItemStep.new(
+		:step-name('m'),
+		:item-list(<a b c d>),
+		:content-keys,
+		script => %( b => %(kind => 'die-always'), d => %(kind => 'die-always') ),
+		:step-item-retry(LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(1))),
+	);
+	my ($ctx, @events) := run-step($step, :degree(2));
+	is-deeply $ctx.get('m/dead').List, ('b', 'd'), 'dead keys sorted list';
+	is-deeply $ctx.get('m/items').keys.sort.list, ('a', 'c'), 'live items only in items map';
+};
+
+subtest 'StepCompleted for item step carries item tallies' => {
+	plan 3;
+	my $step = ScriptedItemStep.new(
+		:step-name('t'),
+		:item-list(<a b c>),
+		:content-keys,
+		script => %( c => %(kind => 'die-always') ),
+		:step-item-retry(LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(1))),
+	);
+	my ($ctx, @events) := run-step($step, :degree(1));
+	my $sc = @events.first(* ~~ LLM::Data::Pipeline::Event::StepCompleted);
+	is $sc.items-done, 2, 'items-done tallied';
+	is $sc.items-dead, 1, 'items-dead tallied';
+	my $rc = @events.first(* ~~ LLM::Data::Pipeline::Event::RunCompleted);
+	is-deeply ($rc.items-done, $rc.items-dead), (2, 1), 'run-completed aggregates item tallies';
+};
+
+subtest 'Plain-step StepCompleted omits item tallies' => {
+	plan 2;
+	my @events;
+	my $runner = LLM::Data::Pipeline::Runner.new(
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my $plan = LLM::Data::Pipeline::Plan.new;
+	$plan.add-step(SetKeyStep.new(:step-name('p'), :key('x'), :val(1)));
+	$runner.run($plan, LLM::Data::Pipeline::Context.new);
+	my $sc = @events.first(* ~~ LLM::Data::Pipeline::Event::StepCompleted);
+	nok $sc.items-done.defined, 'items-done undefined for plain step';
+	nok $sc.to-hash<items-done>:exists, 'omitted from to-hash for plain step';
+};
+
+subtest 'Event ordering: step-started ≺ item events ≺ step-completed' => {
+	plan 3;
+	my $step = ScriptedItemStep.new(:step-name('o'), :item-list((1,2,3,4)));
+	my ($ctx, @events) := run-step($step, :degree(2));
+	my $started = @events.first(* ~~ LLM::Data::Pipeline::Event::StepStarted);
+	my $completed = @events.first(* ~~ LLM::Data::Pipeline::Event::StepCompleted);
+	my @item-evts = @events.grep(* ~~ any(
+		LLM::Data::Pipeline::Event::ItemStarted,
+		LLM::Data::Pipeline::Event::ItemCompleted,
+		LLM::Data::Pipeline::Event::Progress));
+	ok @item-evts.all.seq > $started.seq, 'all item events after step-started';
+	ok @item-evts.all.seq < $completed.seq, 'all item events before step-completed';
+	# seq is a strict total order with no gaps
+	my @seqs = @events.map(*.seq);
+	is-deeply @seqs.List, (1 .. @events.elems).List, 'seq contiguous 1..N';
+};
+
+subtest 'Progress payload includes pending and is consistent' => {
+	plan 2;
+	my $step = ScriptedItemStep.new(:step-name('pg'), :item-list((1,2,3,4,5)));
+	my ($ctx, @events) := run-step($step, :degree(1));
+	my @progress = @events.grep(* ~~ LLM::Data::Pipeline::Event::Progress);
+	is @progress.elems, 5, 'one progress per terminal transition';
+	ok @progress.tail.done == 5, 'final progress shows all done';
+};
+
+subtest 'degree 1 and degree 4 yield identical final state' => {
+	plan 3;
+	my sub make {
+		ScriptedItemStep.new(
+			:step-name('eq'),
+			:item-list(<k0 k1 k2 k3 k4 k5 k6 k7>),
+			:content-keys,
+			script => %(
+				k2 => %(kind => 'flaky', fails => 1),
+				k5 => %(kind => 'die-always'),
+				k7 => %(kind => 'flaky', fails => 2),
+			),
+			:step-item-retry(LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(3), :base-delay(0), :jitter(0))),
+		);
+	}
+	my ($seam1, @d1) = instant-timer();
+	my $r1 = LLM::Data::Pipeline::Runner.new(:degree(1), schedule-after => $seam1);
+	my $c1 = LLM::Data::Pipeline::Context.new;
+	my $p1 = LLM::Data::Pipeline::Plan.new; $p1.add-step(make());
+	$r1.run($p1, $c1);
+
+	my ($seam4, @d4) = instant-timer();
+	my $r4 = LLM::Data::Pipeline::Runner.new(:degree(4), schedule-after => $seam4);
+	my $c4 = LLM::Data::Pipeline::Context.new;
+	my $p4 = LLM::Data::Pipeline::Plan.new; $p4.add-step(make());
+	$r4.run($p4, $c4);
+
+	is-deeply $c1.get('eq/items'), $c4.get('eq/items'), 'identical item results';
+	is-deeply $c1.get('eq/dead'), $c4.get('eq/dead'), 'identical dead set';
+	is-deeply $c1.snapshot, $c4.snapshot, 'identical full context snapshot';
+};

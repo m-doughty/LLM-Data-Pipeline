@@ -1,0 +1,194 @@
+use Test;
+use lib 'lib', 't/lib';
+use LLM::Data::Pipeline::Runner;
+use LLM::Data::Pipeline::Plan;
+use LLM::Data::Pipeline::Context;
+use LLM::Data::Pipeline::Step::Items;
+use LLM::Data::Pipeline::Event;
+use LLM::Data::Pipeline::RetryPolicy;
+use PipelineTestKit;
+use JSONL::Reader;
+
+plan 5;
+
+# Collects everything written to $*ERR so we can assert on `note` output.
+my class ErrCollector {
+	has @.lines;
+	method print(*@a)  { @!lines.push(@a.join); Nil }
+	method say(*@a)    { @!lines.push(@a.join); Nil }
+	method flush(|)    { Nil }
+	method text        { @!lines.join }
+}
+
+my IO::Path $tmpdir = $*TMPDIR.add("pipeline-items-telem-{$*PID}");
+$tmpdir.mkdir;
+END { $tmpdir.dir>>.unlink if $tmpdir.d; $tmpdir.rmdir if $tmpdir.d; }
+sub tmp(Str:D $n) { $tmpdir.add($n) }
+
+# A step that forwards inference telemetry through the Runner's sink, mirroring
+# how a real step wires telemetry-sink into an LLM::Data::Inference Task.
+class TelemStep does LLM::Data::Pipeline::Step::Items {
+	has $.runner is rw;
+	method name(--> Str:D) { 'tel' }
+	method description(--> Str:D) { 'telemetry demo' }
+	method provides(--> List) { ('tel/items',) }
+	method items($ctx --> Iterable) { <a b>.list }
+	method item-key(Int:D $i, $item --> Str:D) { $item }
+	method process-item($ctx, $item, Str:D $key --> Any) {
+		my &sink = $!runner.telemetry-sink(:step('tel'), :$key);
+		if $key eq 'b' {
+			sink({
+				stage    => 'exhausted',
+				attempts => [ { model => 'm1', error => 'net' }, { model => 'm2', error => 'parse' } ],
+				summary  => 'all backends failed for b',
+			});
+			die 'b permanent';
+		}
+		sink({ stage => 'success', attempts => [] });
+		"ok-$key";
+	}
+}
+
+subtest 'Telemetry events emitted for each sink call' => {
+	plan 3;
+	my $step = TelemStep.new;
+	my @events;
+	my $r = LLM::Data::Pipeline::Runner.new(
+		:degree(1),
+		item-retry => LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(1)),
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	$step.runner = $r;
+	my $p = LLM::Data::Pipeline::Plan.new; $p.add-step($step);
+	$r.run($p, LLM::Data::Pipeline::Context.new);
+
+	my @tel = @events.grep(* ~~ LLM::Data::Pipeline::Event::Telemetry);
+	is @tel.elems, 2, 'one telemetry event per sink call';
+	my $exh = @tel.first({ .stage eq 'exhausted' });
+	ok $exh.defined, 'exhausted-stage telemetry captured';
+	is $exh.key, 'b', 'telemetry carries the item key';
+};
+
+subtest 'DLQ inference block comes from the last exhausted telemetry' => {
+	plan 3;
+	my IO::Path $cp = tmp('tel.checkpoint.json');
+	my $step = TelemStep.new;
+	my $r = LLM::Data::Pipeline::Runner.new(
+		:degree(1),
+		item-retry => LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(1)),
+	);
+	$step.runner = $r;
+	my $p = LLM::Data::Pipeline::Plan.new; $p.add-step($step);
+	$r.run($p, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+
+	my IO::Path $dlq = tmp('tel.dlq.jsonl');
+	my @records = JSONL::Reader.new(:path($dlq)).list.map(*.value);
+	my %b = @records.first({ .<key> eq 'b' });
+	ok %b<inference>:exists, 'DLQ record has an inference block';
+	is %b<inference><summary>, 'all backends failed for b', 'inference summary threaded through';
+	is %b<inference><attempts>.elems, 2, 'inference attempts preserved';
+};
+
+subtest 'telemetry-sink with no active step drops safely' => {
+	plan 1;
+	my $r = LLM::Data::Pipeline::Runner.new;
+	my &sink = $r.telemetry-sink(:step('nope'), :key('k'));
+	# No item step active — must not throw (drops with a note to stderr).
+	my $*ERR = class :: { method print(|) {}; method say(|) {}; method flush(|) {} }.new;
+	lives-ok { sink({ stage => 'success' }) }, 'sink is a safe no-op when idle';
+};
+
+# F3a — coordinator step-guard: a message minted for a different step name that
+# lands in the active step's inbox is dropped with a note, never polluting the
+# active step's telemetry / DLQ inference block.
+class MislabelStep does LLM::Data::Pipeline::Step::Items {
+	has $.runner is rw;
+	method name(--> Str:D) { 'B' }
+	method description(--> Str:D) { 'fires a correct and a mislabeled sink' }
+	method provides(--> List) { ('B/items',) }
+	method items($ctx --> Iterable) { <x>.list }
+	method item-key(Int:D $i, $item --> Str:D) { $item }
+	method process-item($ctx, $item, Str:D $key --> Any) {
+		# Correct sink for this step.
+		$!runner.telemetry-sink(:step('B'), :$key).(
+			{ stage => 'exhausted', summary => 'CORRECT-B', attempts => [1] });
+		# Mislabeled sink (wrong step) that still targets THIS coordinator's inbox.
+		$!runner.telemetry-sink(:step('OTHER'), :$key).(
+			{ stage => 'exhausted', summary => 'WRONG-OTHER', attempts => [9] });
+		die 'x dies';
+	}
+}
+
+subtest 'Coordinator drops mismatched-step telemetry (note) — no DLQ pollution' => {
+	plan 2;
+	my IO::Path $cp = tmp('guard.checkpoint.json');
+	my $step = MislabelStep.new;
+	my $r = LLM::Data::Pipeline::Runner.new(
+		:degree(1),
+		item-retry => LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(1)),
+	);
+	$step.runner = $r;
+	my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step($step);
+
+	my $collector = ErrCollector.new;
+	{
+		my $*ERR = $collector;
+		$r.run($plan, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+	}
+	my %rec = JSONL::Reader.new(:path(tmp('guard.dlq.jsonl'))).list.map(*.value).first({ .<key> eq 'x' });
+	is %rec<inference><summary>, 'CORRECT-B', 'DLQ inference is the correct step, not the mislabeled one';
+	like $collector.text, /'OTHER'/, 'a note was emitted about the dropped mismatched telemetry';
+};
+
+# F3b — mint-time inbox capture: a sink minted during step A, fired during step B,
+# routes to A's (drained) inbox and never reaches B.
+class SinkStashStepA does LLM::Data::Pipeline::Step::Items {
+	has $.runner is rw;
+	has $.stash;   # array to receive the minted sink closure
+	method name(--> Str:D) { 'A' }
+	method description(--> Str:D) { 'stashes a telemetry sink' }
+	method provides(--> List) { ('A/items',) }
+	method items($ctx --> Iterable) { <a>.list }
+	method item-key(Int:D $i, $item --> Str:D) { $item }
+	method process-item($ctx, $item, Str:D $key --> Any) {
+		$!stash.push($!runner.telemetry-sink(:step('A'), :$key));
+		'ok-a';
+	}
+}
+
+class DyingStepB does LLM::Data::Pipeline::Step::Items {
+	method name(--> Str:D) { 'B' }
+	method description(--> Str:D) { 'has a dead item' }
+	method provides(--> List) { ('B/items',) }
+	method items($ctx --> Iterable) { <b>.list }
+	method item-key(Int:D $i, $item --> Str:D) { $item }
+	method process-item($ctx, $item, Str:D $key --> Any) { die 'b dies' }
+}
+
+subtest 'Sink minted in step A cannot pollute step B (mint-time inbox capture)' => {
+	plan 1;
+	my IO::Path $cp = tmp('cross.checkpoint.json');
+	my @stash;
+	my $stepA = SinkStashStepA.new(:stash(@stash));
+	my $stepB = DyingStepB.new;
+	my $r = LLM::Data::Pipeline::Runner.new(
+		:degree(1),
+		item-retry => LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(1)),
+		on-event => -> LLM::Data::Pipeline::Event $e {
+			# When step B starts, fire the sink minted during step A. It is bound to
+			# A's inbox, so it must NOT reach B's coordinator.
+			if $e ~~ LLM::Data::Pipeline::Event::StepStarted && $e.step eq 'B' && @stash {
+				@stash[0].({ stage => 'exhausted', summary => 'LEAK-FROM-A', attempts => [7] });
+			}
+		},
+	);
+	$stepA.runner = $r;
+	my $plan = LLM::Data::Pipeline::Plan.new;
+	$plan.add-step($stepA);
+	$plan.add-step($stepB);
+	$r.run($plan, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+
+	my %rec = JSONL::Reader.new(:path(tmp('cross.dlq.jsonl'))).list.map(*.value).first({ .<key> eq 'b' });
+	nok %rec<inference>:exists,
+		"B's DLQ record carries no inference — the step-A sink did not leak into B";
+};

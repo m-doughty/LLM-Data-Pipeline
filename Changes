@@ -2,6 +2,82 @@ Revision history for LLM::Data::Pipeline
 
 {{$NEXT}}
 
+0.5.0  2026-07-21T03:12:48+01:00
+    - run-until-done: whole-run supervision that resumes a pipeline to completion
+      across process-local retries (attempt 1 resumes an existing checkpoint,
+      else runs; later attempts resume). Transient failures back off via
+      &.schedule-after and retry; Cancelled / CheckpointDrift / plan-validation
+      failures rethrow immediately, as does ItemsDead unless :retry-dead (which
+      makes it retryable). Budget exhaustion rethrows the last error unchanged.
+    - run-retry event promoted from reserved to emitted (0.5.0): a supervision
+      event delivered via on-event, carrying seq 0 (outside any single run's
+      sequence) and the lineage run-id; payload attempt/max-attempts/delay/
+      error/exception.
+    - Documented that DLQ dedupe by (run-id, step, key) is sound only because
+      run-id is a stable lineage id (minted by run, adopted by every resume).
+    - Pod6: run-until-done reference + an Operational Recipes section
+      (in-process retries vs external supervisor, DLQ triage with JSONL::Reader /
+      jq, the retry-dead decision guide).
+
+    - Step::Items: parallel, per-item pipeline steps. Implement items /
+      process-item / finalize instead of execute; the Runner drives them through
+      a single-coordinator engine (N workers pull from a work Channel, message
+      results back through one inbox; the coordinator owns all state, so event
+      seq, checkpoint, and DLQ writes are single-writer with no locks). Per-step
+      degree + item-retry overrides; :degree(1) is the sequential path.
+    - Context freeze/thaw: the Context is frozen during item processing so a
+      worker-thread mutation dies loudly instead of racing.
+    - Checkpoint v2: version/run-id/step-state/updated-at, with per-item and
+      dead-letter checkpoints (coalesced via checkpoint-every / checkpoint-
+      interval; dead-letter/step/cancel writes are never coalesced away). v1
+      checkpoints are still accepted on resume. run-id is now a stable lineage id
+      adopted from the checkpoint on resume.
+    - Dead-letter queue: a crash-safe JSONL journal (foo.checkpoint.json →
+      foo.dlq.jsonl) written DLQ-first-then-checkpoint on exhaustion; append
+      failure is fatal. Records carry item-digest, attempt-history, error, and an
+      optional inference block sourced from telemetry-sink.
+    - resume(:retry-dead): requeue dead items, reopen a completed step and
+      invalidate every later step, verifying item digests (CheckpointDrift on
+      mismatch).
+    - Cooperative cancellation via &.is-cancelled: drain in-flight, checkpoint,
+      emit run-cancelled, throw X::LLM::Data::Pipeline::Cancelled.
+    - fail-on-dead item steps throw X::LLM::Data::Pipeline::ItemsDead after the
+      step is finalized and checkpointed.
+    - Item/Progress/Telemetry/RunCancelled/ItemRequeued events promoted from
+      reserved to emitted; step-completed carries items-done/items-dead for item
+      steps.
+    - New depends: JSONL, Digest::SHA256::Native (Pipeline is now tier 1).
+
+    - Step retry infrastructure. New LLM::Data::Pipeline::RetryPolicy
+      (exponential backoff with cap + jitter; deliberately slower than the
+      inference layer's per-call backoff). New LLM::Data::Pipeline::Exceptions:
+      X::LLM::Data::Pipeline::StepExhausted thrown on exhausted retries (carries
+      step, attempts, last-error); Cancelled/ItemsDead/CheckpointDrift declared
+      for later stages.
+    - Runner: &.step-retry policy (default max-attempts 1 = unchanged
+      abort-on-first-failure, rethrowing the step's ORIGINAL exception; retry is
+      opt-in). With retries enabled, failed attempts emit step-failed
+      (will-retry, retry-delay) and step-retry, backing off via the injectable
+      &.schedule-after; exhaustion throws StepExhausted. Injectable &.now / &.
+      schedule-after for deterministic tests.
+    - step-failed / step-retry events promoted from reserved to emitted;
+      step-failed payload gained will-retry and retry-delay.
+    - NOTE: a failed attempt's Context mutations are not rolled back — step
+      retry implies the step is idempotent or tolerant of its own partial
+      writes.
+
+    - Unified typed event stream (LLM::Data::Pipeline::Event): immutable event
+      classes over a shared role carrying seq/at/run-id + JSON-safe to-hash.
+      Full taxonomy declared now; run-started, step-skipped, step-started,
+      step-completed, checkpoint-written, run-completed and run-failed emitted.
+    - Runner: new &.on-event synchronous callback (strict per-run seq order,
+      handler exceptions shielded) and events() Supply adapter (done fires on
+      success and failure). run-failed wraps the step loop and rethrows the
+      original exception unchanged.
+    - Per-run run-id minted for every run()/resume() call.
+    - &.on-step retained as a deprecated shim over the event stream (removed at
+      1.0); behavior is byte-for-byte identical to prior releases.
+
 0.1.1  2026-04-29T23:51:00+01:00
     - Bump Github actions to use node 24+
     - Added auth specifiers to META6.json dependencies

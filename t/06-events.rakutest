@@ -1,0 +1,365 @@
+use Test;
+use lib 'lib';
+use LLM::Data::Pipeline::Runner;
+use LLM::Data::Pipeline::Plan;
+use LLM::Data::Pipeline::Step;
+use LLM::Data::Pipeline::Context;
+use LLM::Data::Pipeline::Event;
+use JSON::Fast;
+
+plan 13;
+
+my IO::Path $tmpdir = $*TMPDIR.add("pipeline-events-test-{$*PID}");
+$tmpdir.mkdir;
+
+END { $tmpdir.dir>>.unlink if $tmpdir.d; $tmpdir.rmdir if $tmpdir.d; }
+
+sub tmp-path(Str:D $name --> IO::Path:D) { $tmpdir.add($name) }
+
+# --- Test step helpers ---
+
+class SetKeyStep does LLM::Data::Pipeline::Step {
+	has Str:D $.step-name is required;
+	has Str:D $.key is required;
+	has $.val is required;
+	method name(--> Str:D) { $!step-name }
+	method description(--> Str:D) { "Sets $!key" }
+	method provides(--> List) { ($!key,) }
+	method execute(LLM::Data::Pipeline::Context:D $ctx --> Nil) {
+		$ctx.set($!key, $!val);
+	}
+}
+
+class FailStep does LLM::Data::Pipeline::Step {
+	has Str:D $.step-name is required;
+	method name(--> Str:D) { $!step-name }
+	method description(--> Str:D) { 'Always fails' }
+	method provides(--> List) { ('never',) }
+	method execute(LLM::Data::Pipeline::Context:D $ctx --> Nil) {
+		die "FailStep intentional error";
+	}
+}
+
+# A stderr sink so we can assert the shielded `note` path without polluting
+# the test output.
+my class NullErr {
+	method print(|)   { Nil }
+	method say(|)     { Nil }
+	method flush(|)   { Nil }
+	method print-nl(|) { Nil }
+}
+
+# --- Tests ---
+
+subtest 'Fresh run with checkpoint — exact event kind sequence' => {
+	plan 6;
+	my IO::Path $cp = tmp-path('fresh.json');
+	my @kinds;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		on-event => -> LLM::Data::Pipeline::Event $e { @kinds.push($e.kind) },
+	);
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('a'), :key('x'), :val(1)));
+	$plan.add-step(SetKeyStep.new(:step-name('b'), :key('y'), :val(2)));
+	$runner.run($plan, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+
+	is-deeply @kinds, [
+		'run-started',
+		'step-started', 'checkpoint-written', 'step-completed',
+		'step-started', 'checkpoint-written', 'step-completed',
+		'run-completed',
+	], 'Exact event train for a fresh two-step run with checkpoint';
+
+	# Re-run capturing full objects to inspect payloads.
+	my @events;
+	my LLM::Data::Pipeline::Runner $r2 .= new(
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	$r2.run($plan, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+
+	my $started = @events.first(* ~~ LLM::Data::Pipeline::Event::RunStarted);
+	is $started.plan-size, 2, 'run-started carries plan-size';
+	is $started.resumed, False, 'run-started resumed=False on fresh run';
+	is $started.checkpoint-path, $cp.Str, 'run-started carries checkpoint-path';
+
+	my $completed = @events.first(* ~~ LLM::Data::Pipeline::Event::RunCompleted);
+	is $completed.steps-run, 2, 'run-completed steps-run=2';
+	is $completed.steps-skipped, 0, 'run-completed steps-skipped=0';
+};
+
+subtest 'Fresh run without checkpoint — no checkpoint-written events' => {
+	plan 2;
+	my @events;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('a'), :key('x'), :val(1)));
+	$runner.run($plan, LLM::Data::Pipeline::Context.new);
+
+	nok @events.grep(* ~~ LLM::Data::Pipeline::Event::CheckpointWritten).elems,
+		'No checkpoint-written events without a checkpoint path';
+	my $started = @events.first(* ~~ LLM::Data::Pipeline::Event::RunStarted);
+	is $started.checkpoint-path, Str, 'run-started checkpoint-path is undefined Str';
+};
+
+subtest 'Resume — completed steps arrive as step-skipped' => {
+	plan 3;
+	my IO::Path $cp = tmp-path('resume.json');
+	my %checkpoint = %(
+		completed-steps => ('a',),
+		context => %(:x(1)),
+	);
+	$cp.spurt(to-json(%checkpoint));
+
+	my @events;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('a'), :key('x'), :val(1)));
+	$plan.add-step(SetKeyStep.new(:step-name('b'), :key('y'), :val(2)));
+	$runner.resume($plan, $cp);
+
+	is-deeply @events.map(*.kind).List, (
+		'run-started',
+		'step-skipped',
+		'step-started', 'checkpoint-written', 'step-completed',
+		'run-completed',
+	), 'Resume event train: skip completed, run remaining';
+
+	my $started = @events.first(* ~~ LLM::Data::Pipeline::Event::RunStarted);
+	is $started.resumed, True, 'run-started resumed=True on resume';
+
+	my $completed = @events.first(* ~~ LLM::Data::Pipeline::Event::RunCompleted);
+	is-deeply ($completed.steps-run, $completed.steps-skipped), (1, 1),
+		'run-completed counts: 1 run, 1 skipped';
+};
+
+subtest 'Step dies mid-run — run-failed payload + rethrow + Supply done' => {
+	plan 6;
+	my @events;
+	my Bool $done = False;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	$runner.events.tap(-> $e { }, done => { $done = True });
+
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('ok'), :key('x'), :val(1)));
+	$plan.add-step(FailStep.new(:step-name('boom')));
+
+	my $err;
+	{
+		$runner.run($plan, LLM::Data::Pipeline::Context.new);
+		CATCH { default { $err = $_ } }
+	}
+
+	ok $err.defined, 'Exception rethrown to caller';
+	like $err.message, /'FailStep intentional error'/, 'Original exception message preserved';
+
+	is-deeply @events.map(*.kind).List, (
+		'run-started',
+		'step-started', 'step-completed',   # 'ok'
+		'step-started',                      # 'boom' starts then dies
+		'run-failed',
+	), 'Event train ends at run-failed, no run-completed';
+
+	my $failed = @events.first(* ~~ LLM::Data::Pipeline::Event::RunFailed);
+	is $failed.step, 'boom', 'run-failed names the failing step';
+	like $failed.error, /'FailStep intentional error'/, 'run-failed carries error message';
+
+	ok $done, 'Supply received done even though the run threw';
+};
+
+subtest 'seq strict monotonicity — 1..N no gaps' => {
+	plan 3;
+	my @events;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('a'), :key('x'), :val(1)));
+	$plan.add-step(SetKeyStep.new(:step-name('b'), :key('y'), :val(2)));
+	$plan.add-step(SetKeyStep.new(:step-name('c'), :key('z'), :val(3)));
+	$runner.run($plan, LLM::Data::Pipeline::Context.new);
+
+	my @seqs = @events.map(*.seq);
+	is @seqs[0], 1, 'seq starts at 1';
+	is-deeply @seqs.List, (1 .. @events.elems).List, 'seq is 1..N contiguous';
+	is @seqs.unique.elems, @seqs.elems, 'No duplicate seq values';
+};
+
+subtest 'run-id stable within a run, differs across runs' => {
+	plan 3;
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('a'), :key('x'), :val(1)));
+
+	my @ids-first;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		on-event => -> LLM::Data::Pipeline::Event $e { @ids-first.push($e.run-id) },
+	);
+	$runner.run($plan, LLM::Data::Pipeline::Context.new);
+	is @ids-first.unique.elems, 1, 'run-id constant within run 1';
+
+	my @ids-second;
+	my LLM::Data::Pipeline::Runner $r2 .= new(
+		on-event => -> LLM::Data::Pipeline::Event $e { @ids-second.push($e.run-id) },
+	);
+	$r2.run($plan, LLM::Data::Pipeline::Context.new);
+	is @ids-second.unique.elems, 1, 'run-id constant within run 2';
+
+	isnt @ids-first[0], @ids-second[0], 'run-id differs across runs';
+};
+
+subtest 'run-id stable across two runs on the SAME Runner instance, but distinct' => {
+	plan 2;
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('a'), :key('x'), :val(1)));
+
+	my @ids;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		on-event => -> LLM::Data::Pipeline::Event $e {
+			@ids.push([$e.run-id, $e.seq]);
+		},
+	);
+	$runner.run($plan, LLM::Data::Pipeline::Context.new);
+	my Int $boundary = @ids.elems;
+	$runner.run($plan, LLM::Data::Pipeline::Context.new);
+
+	my @first-ids  = @ids[^$boundary].map(*[0]);
+	my @second-ids = @ids[$boundary .. *].map(*[0]);
+	isnt @first-ids[0], @second-ids[0], 'Second run() gets a fresh run-id';
+	# seq resets to 1 for the second run
+	is @ids[$boundary][1], 1, 'seq resets to 1 on the second run';
+};
+
+subtest 'on-step shim fires identically when both on-step and on-event set' => {
+	plan 2;
+	my @shim;
+	my @evt;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		on-step  => -> Str:D $name, Str:D $event { @shim.push("$name:$event") },
+		on-event => -> LLM::Data::Pipeline::Event $e { @evt.push($e.kind) },
+	);
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('a'), :key('x'), :val(1)));
+	$plan.add-step(SetKeyStep.new(:step-name('b'), :key('y'), :val(2)));
+	$runner.run($plan, LLM::Data::Pipeline::Context.new);
+
+	is-deeply @shim, ['a:start', 'a:complete', 'b:start', 'b:complete'],
+		'on-step shim matches legacy behavior exactly';
+	ok @evt.elems > @shim.elems, 'on-event received more (run/checkpoint) events than the shim';
+};
+
+subtest 'on-step shim skip events on resume match legacy' => {
+	plan 1;
+	my IO::Path $cp = tmp-path('shim-skip.json');
+	$cp.spurt(to-json(%( completed-steps => ('a',), context => %(:x(1)) )));
+
+	my @shim;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		on-step => -> Str:D $name, Str:D $event { @shim.push("$name:$event") },
+	);
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('a'), :key('x'), :val(1)));
+	$plan.add-step(SetKeyStep.new(:step-name('b'), :key('y'), :val(2)));
+	$runner.resume($plan, $cp);
+
+	is-deeply @shim, ['a:skip', 'b:start', 'b:complete'],
+		'Skip shim event fires for resumed step';
+};
+
+subtest 'Throwing on-event handler does not break the run or skip events' => {
+	plan 3;
+	my @seen;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		on-event => -> LLM::Data::Pipeline::Event $e {
+			@seen.push($e.kind);
+			die "observer blew up" if $e ~~ LLM::Data::Pipeline::Event::StepStarted;
+		},
+	);
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('a'), :key('x'), :val(1)));
+	$plan.add-step(SetKeyStep.new(:step-name('b'), :key('y'), :val(2)));
+
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	{
+		my $*ERR = NullErr.new;   # swallow the shielded-handler `note` noise
+		lives-ok { $runner.run($plan, $ctx) }, 'Run survives a throwing observer';
+	}
+
+	is $ctx.get('x'), 1, 'Step a still executed';
+	is $ctx.get('y'), 2, 'Step b still executed after observer threw on earlier events';
+};
+
+subtest 'events() Supply receives the identical sequence' => {
+	plan 2;
+	my @via-callback;
+	my @via-supply;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		on-event => -> LLM::Data::Pipeline::Event $e { @via-callback.push($e.kind) },
+	);
+	$runner.events.tap(-> $e { @via-supply.push($e.kind) });
+
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('a'), :key('x'), :val(1)));
+	$plan.add-step(SetKeyStep.new(:step-name('b'), :key('y'), :val(2)));
+	$runner.run($plan, LLM::Data::Pipeline::Context.new);
+
+	ok @via-supply.elems > 0, 'Supply received events';
+	is-deeply @via-supply, @via-callback, 'Supply sequence identical to callback sequence';
+};
+
+subtest 'Supply gets done on normal completion' => {
+	plan 1;
+	my Bool $done = False;
+	my LLM::Data::Pipeline::Runner $runner .= new;
+	$runner.events.tap(-> $e { }, done => { $done = True });
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('a'), :key('x'), :val(1)));
+	$runner.run($plan, LLM::Data::Pipeline::Context.new);
+	ok $done, 'done fired after a successful run';
+};
+
+subtest 'to-hash of every Stage-2 event is JSON round-trippable' => {
+	plan 1;
+	my IO::Path $cp = tmp-path('json.json');
+	# Build a checkpoint so a resume produces a step-skipped too.
+	$cp.spurt(to-json(%( completed-steps => ('a',), context => %(:x(1)) )));
+
+	my @events;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(SetKeyStep.new(:step-name('a'), :key('x'), :val(1)));
+	$plan.add-step(SetKeyStep.new(:step-name('b'), :key('y'), :val(2)));
+	$plan.add-step(FailStep.new(:step-name('boom')));
+	# Run in its own block so the boom unwinds only to here; @events is fully
+	# populated synchronously before the throw propagates.
+	{
+		$runner.resume($plan, $cp);
+		CATCH { default { } }
+	}
+
+	# Ensure we exercised every Stage-2 kind at least once across two runs.
+	my $ok = True;
+	my %kinds-seen;
+	for @events -> LLM::Data::Pipeline::Event $e {
+		%kinds-seen{$e.kind} = True;
+		my %h = $e.to-hash;
+		my $json = to-json(%h);
+		my %back = from-json($json);
+		$ok = False unless %back<kind>   eqv $e.kind;
+		$ok = False unless %back<seq>    eqv $e.seq;
+		$ok = False unless %back<run-id> eqv $e.run-id;
+		$ok = False unless %back<at>.defined;
+	}
+	# We should have seen: run-started, step-skipped, step-started,
+	# checkpoint-written, step-completed, run-failed.
+	my @expected = <run-started step-skipped step-started checkpoint-written
+		step-completed run-failed>;
+	$ok = False unless all(@expected.map({ %kinds-seen{$_}:exists }));
+	ok $ok, 'All emitted Stage-2 events round-trip through JSON with intact envelope';
+};

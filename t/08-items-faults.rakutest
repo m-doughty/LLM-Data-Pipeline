@@ -1,0 +1,116 @@
+use Test;
+use lib 'lib', 't/lib';
+use LLM::Data::Pipeline::Runner;
+use LLM::Data::Pipeline::Plan;
+use LLM::Data::Pipeline::Context;
+use LLM::Data::Pipeline::Step::Items;
+use LLM::Data::Pipeline::RetryPolicy;
+use PipelineTestKit;
+
+plan 4;
+
+my IO::Path $tmpdir = $*TMPDIR.add("pipeline-items-faults-{$*PID}");
+$tmpdir.mkdir;
+END { $tmpdir.dir>>.unlink if $tmpdir.d; $tmpdir.rmdir if $tmpdir.d; }
+sub tmp(Str:D $n) { $tmpdir.add($n) }
+
+# --- Fix A: an exception inside the coordinator (checkpoint write) must not
+#     leak workers or leave the caller's Context permanently frozen. ---
+
+# process-item returns a value that cannot be JSON-serialised; the failure
+# surfaces inside write-checkpoint on the coordinator thread.
+class NonSerializableStep does LLM::Data::Pipeline::Step::Items {
+	method name(--> Str:D) { 'ns' }
+	method description(--> Str:D) { 'returns a Sub' }
+	method provides(--> List) { ('ns/items',) }
+	method items($ctx --> Iterable) { <a b>.list }
+	method item-key(Int:D $i, $item --> Str:D) { $item }
+	method process-item($ctx, $item, Str:D $key --> Any) { sub { 42 } }
+}
+
+subtest 'Coordinator exception thaws the Context and does not leak workers' => {
+	plan 3;
+	my IO::Path $cp = tmp('ns.checkpoint.json');
+	my $runner = LLM::Data::Pipeline::Runner.new(:degree(2));
+	my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step(NonSerializableStep.new);
+	my $ctx = LLM::Data::Pipeline::Context.new;
+
+	my $err;
+	{ $runner.run($plan, $ctx, :checkpoint-path($cp)); CATCH { default { $err = $_ } } }
+	ok $err.defined, 'run threw (non-serializable result blew up the checkpoint)';
+	nok $ctx.frozen, 'the caller Context was thawed on the way out';
+	# The Context is usable again (would die if still frozen).
+	lives-ok { $ctx.set('after', 1) }, 'Context is writable again after the failure';
+};
+
+subtest 'Runner instance is reusable after a coordinator failure' => {
+	plan 1;
+	my IO::Path $cp = tmp('reuse.checkpoint.json');
+	my $runner = LLM::Data::Pipeline::Runner.new(:degree(2));
+
+	# First run fails inside the coordinator.
+	my $p1 = LLM::Data::Pipeline::Plan.new; $p1.add-step(NonSerializableStep.new);
+	{ $runner.run($p1, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp)); CATCH { default {} } }
+
+	# A fresh, well-behaved run on the SAME Runner must complete.
+	my $good = ScriptedItemStep.new(:step-name('ok'), :item-list(<x y z>), :content-keys);
+	my $p2 = LLM::Data::Pipeline::Plan.new; $p2.add-step($good);
+	my $ctx2 = $runner.run($p2, LLM::Data::Pipeline::Context.new);
+	is $ctx2.get('ok/items').keys.sort.list.elems, 3, 'later run on the same Runner succeeds';
+};
+
+subtest 'Unwritable checkpoint path fails cleanly (Context thawed)' => {
+	plan 2;
+	# Make the checkpoint path live *under a regular file* so every write fails
+	# on every platform (no chmod tricks).
+	my IO::Path $blocker = tmp('blocker');
+	$blocker.spurt('not a directory');
+	my IO::Path $cp = $blocker.add('foo.checkpoint.json');
+
+	my $runner = LLM::Data::Pipeline::Runner.new(:degree(1));
+	my $step = ScriptedItemStep.new(:step-name('u'), :item-list(<a b>), :content-keys);
+	my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step($step);
+	my $ctx = LLM::Data::Pipeline::Context.new;
+
+	my $err;
+	{ $runner.run($plan, $ctx, :checkpoint-path($cp)); CATCH { default { $err = $_ } } }
+	ok $err.defined, 'run threw on the unwritable checkpoint path';
+	nok $ctx.frozen, 'Context thawed despite the checkpoint write failure';
+};
+
+# --- Fix B: a hostile exception whose .message accessor itself throws must not
+#     strand the item (coordinator would otherwise hang forever). ---
+
+class ExplodingMessage is Exception {
+	method message(--> Str) { die 'message accessor exploded' }
+}
+
+class HostileStep does LLM::Data::Pipeline::Step::Items {
+	method name(--> Str:D) { 'h' }
+	method description(--> Str:D) { 'throws an exception with a booby-trapped message' }
+	method provides(--> List) { ('h/items',) }
+	method items($ctx --> Iterable) { <a b c>.list }
+	method item-key(Int:D $i, $item --> Str:D) { $item }
+	method process-item($ctx, $item, Str:D $key --> Any) {
+		die ExplodingMessage.new if $key eq 'b';
+		"ok-$key";
+	}
+}
+
+subtest 'Item throwing an exception with a throwing .message terminates, no hang' => {
+	plan 3;
+	my $runner = LLM::Data::Pipeline::Runner.new(
+		:degree(2),
+		item-retry => LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(1)),
+	);
+	my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step(HostileStep.new);
+	my $ctx = LLM::Data::Pipeline::Context.new;
+
+	# Run off-thread with a hard timeout so a regression fails fast, never hangs CI.
+	my $run = start { $runner.run($plan, $ctx); CATCH { default {} } };
+	await Promise.anyof($run, Promise.in(15));
+
+	ok $run.status ~~ Kept, 'run terminated within the timeout (did not hang)';
+	is-deeply $ctx.get('h/items').keys.sort.list, ('a', 'c'), 'well-behaved items completed';
+	is-deeply $ctx.get('h/dead').List, ('b',), 'hostile item was dead-lettered, not stranded';
+};

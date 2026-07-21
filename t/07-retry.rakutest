@@ -1,0 +1,342 @@
+use Test;
+use lib 'lib';
+use LLM::Data::Pipeline::Runner;
+use LLM::Data::Pipeline::Plan;
+use LLM::Data::Pipeline::Step;
+use LLM::Data::Pipeline::Context;
+use LLM::Data::Pipeline::Event;
+use LLM::Data::Pipeline::RetryPolicy;
+use LLM::Data::Pipeline::Exceptions;
+use JSON::Fast;
+
+plan 12;
+
+my IO::Path $tmpdir = $*TMPDIR.add("pipeline-retry-test-{$*PID}");
+$tmpdir.mkdir;
+
+END { $tmpdir.dir>>.unlink if $tmpdir.d; $tmpdir.rmdir if $tmpdir.d; }
+
+sub tmp-path(Str:D $name --> IO::Path:D) { $tmpdir.add($name) }
+
+# --- Test step helpers ---
+
+class SetKeyStep does LLM::Data::Pipeline::Step {
+	has Str:D $.step-name is required;
+	has Str:D $.key is required;
+	has $.val is required;
+	method name(--> Str:D) { $!step-name }
+	method description(--> Str:D) { "Sets $!key" }
+	method provides(--> List) { ($!key,) }
+	method execute(LLM::Data::Pipeline::Context:D $ctx --> Nil) {
+		$ctx.set($!key, $!val);
+	}
+}
+
+# Fails its first $.fails attempts (per instance), then succeeds.
+class FlakyStep does LLM::Data::Pipeline::Step {
+	has Str:D $.step-name is required;
+	has Int:D $.fails is required;
+	has Int   $!count = 0;
+	method name(--> Str:D) { $!step-name }
+	method description(--> Str:D) { 'Flaky' }
+	method provides(--> List) { ('out',) }
+	method execute(LLM::Data::Pipeline::Context:D $ctx --> Nil) {
+		$!count++;
+		die "flaky failure #$!count" if $!count <= $!fails;
+		$ctx.set('out', "ok-after-$!count");
+	}
+}
+
+class DieStep does LLM::Data::Pipeline::Step {
+	has Str:D $.step-name is required;
+	has Str:D $.msg = 'die-always error';
+	method name(--> Str:D) { $!step-name }
+	method description(--> Str:D) { 'Always fails' }
+	method provides(--> List) { ('never',) }
+	method execute(LLM::Data::Pipeline::Context:D $ctx --> Nil) {
+		die $!msg;
+	}
+}
+
+# A distinct exception type so we can assert the original type flows out.
+class X::Custom::Boom is Exception {
+	method message(--> Str) { 'custom boom' }
+}
+
+class CustomDieStep does LLM::Data::Pipeline::Step {
+	method name(--> Str:D) { 'custom-die' }
+	method description(--> Str:D) { 'Throws a typed exception' }
+	method provides(--> List) { ('never',) }
+	method execute(LLM::Data::Pipeline::Context:D $ctx --> Nil) {
+		die X::Custom::Boom.new;
+	}
+}
+
+# A schedule-after that records delays and never actually waits.
+sub capturing-timer(@sink) {
+	-> Real $s, &cb { @sink.push($s); Promise.kept }
+}
+
+# --- RetryPolicy unit tests ---
+
+subtest 'RetryPolicy.delay-for — exponential backoff, jitter 0' => {
+	plan 4;
+	my $p = LLM::Data::Pipeline::RetryPolicy.new(
+		:max-attempts(5), :base-delay(2), :max-delay(120), :jitter(0),
+	);
+	is $p.delay-for(1), 2, 'attempt 1 → base-delay';
+	is $p.delay-for(2), 4, 'attempt 2 → doubled';
+	is $p.delay-for(3), 8, 'attempt 3 → quadrupled';
+	is $p.delay-for(4), 16, 'attempt 4 → x8';
+};
+
+subtest 'RetryPolicy.delay-for — capped at max-delay (jitter 0)' => {
+	plan 3;
+	my $p = LLM::Data::Pipeline::RetryPolicy.new(
+		:base-delay(2), :max-delay(5), :jitter(0),
+	);
+	is $p.delay-for(3), 5, 'exponential 8 capped to max-delay 5';
+	is $p.delay-for(10), 5, 'large attempt still capped';
+	is $p.delay-for(1), 2, 'below-cap value unaffected';
+};
+
+subtest 'RetryPolicy.delay-for — jitter adds bounded noise' => {
+	plan 2;
+	my $p = LLM::Data::Pipeline::RetryPolicy.new(
+		:base-delay(2), :max-delay(120), :jitter(0.5),
+	);
+	my @samples = (^200).map({ $p.delay-for(1) });
+	ok @samples.all >= 2, 'never below the exponential floor';
+	ok @samples.all < 2 + 0.5, 'never at/above floor + jitter';
+};
+
+subtest 'RetryPolicy.exhausted — budget boundary' => {
+	plan 4;
+	my $p = LLM::Data::Pipeline::RetryPolicy.new(:max-attempts(3));
+	nok $p.exhausted(1), '1 of 3 — not exhausted';
+	nok $p.exhausted(2), '2 of 3 — not exhausted';
+	ok $p.exhausted(3), '3 of 3 — exhausted';
+	ok $p.exhausted(4), 'past budget — exhausted';
+};
+
+# --- Runner retry behavior ---
+
+subtest 'Fail-twice-then-succeed — event train + final success' => {
+	plan 5;
+	my @delays;
+	my @events;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		step-retry => LLM::Data::Pipeline::RetryPolicy.new(
+			:max-attempts(3), :base-delay(0), :jitter(0),
+		),
+		schedule-after => capturing-timer(@delays),
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(FlakyStep.new(:step-name('flaky'), :fails(2)));
+	my LLM::Data::Pipeline::Context $ctx .= new;
+	$runner.run($plan, $ctx);
+
+	is-deeply @events.map(*.kind).List, (
+		'run-started',
+		'step-started',
+		'step-failed', 'step-retry',
+		'step-failed', 'step-retry',
+		'step-completed',
+		'run-completed',
+	), 'Exact event train for two failures then success';
+
+	is $ctx.get('out'), 'ok-after-3', 'Step succeeded on the third attempt';
+
+	my @failed = @events.grep(* ~~ LLM::Data::Pipeline::Event::StepFailed);
+	is-deeply @failed.map(*.will-retry).List, (True, True),
+		'Both failures announced will-retry=True';
+	is-deeply @failed.map(*.attempt).List, (1, 2),
+		'step-failed attempts count up 1, 2';
+
+	my @retries = @events.grep(* ~~ LLM::Data::Pipeline::Event::StepRetry);
+	is-deeply @retries.map(*.attempt).List, (2, 3),
+		'step-retry names the upcoming attempt (2, then 3)';
+};
+
+subtest 'Exhaustion — StepExhausted thrown, event train ends run-failed' => {
+	plan 6;
+	my @events;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		step-retry => LLM::Data::Pipeline::RetryPolicy.new(
+			:max-attempts(2), :base-delay(0), :jitter(0),
+		),
+		schedule-after => capturing-timer(my @ignore),
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(DieStep.new(:step-name('boom'), :msg('permanent failure')));
+
+	my $err;
+	{
+		$runner.run($plan, LLM::Data::Pipeline::Context.new);
+		CATCH { default { $err = $_ } }
+	}
+
+	ok $err ~~ X::LLM::Data::Pipeline::StepExhausted,
+		'StepExhausted thrown (not the raw exception)';
+	is $err.step, 'boom', 'carries the failing step name';
+	is $err.attempts, 2, 'carries the attempt count';
+	is $err.last-error.message, 'permanent failure',
+		'preserves the last error message';
+
+	is-deeply @events.map(*.kind).List, (
+		'run-started',
+		'step-started',
+		'step-failed', 'step-retry',
+		'step-failed',
+		'run-failed',
+	), 'Event train ends step-failed(will-retry=False) → run-failed';
+
+	my @failed = @events.grep(* ~~ LLM::Data::Pipeline::Event::StepFailed);
+	is-deeply @failed.map(*.will-retry).List, (True, False),
+		'Final step-failed has will-retry=False';
+};
+
+subtest 'Virtual clock — exact backoff schedule, zero real sleeps' => {
+	plan 2;
+	my @delays;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		step-retry => LLM::Data::Pipeline::RetryPolicy.new(
+			:max-attempts(4), :base-delay(2), :max-delay(120), :jitter(0),
+		),
+		schedule-after => capturing-timer(@delays),
+	);
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(DieStep.new(:step-name('boom')));
+
+	my $err;
+	{
+		$runner.run($plan, LLM::Data::Pipeline::Context.new);
+		CATCH { default { $err = $_ } }
+	}
+	ok $err ~~ X::LLM::Data::Pipeline::StepExhausted, 'run exhausted after 4 attempts';
+	is @delays.join(','), '2,4,8',
+		'Backoff delays are 2, 4, 8 (three retries before the fourth attempt)';
+};
+
+subtest 'Virtual clock — backoff capped at max-delay' => {
+	plan 1;
+	my @delays;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		step-retry => LLM::Data::Pipeline::RetryPolicy.new(
+			:max-attempts(5), :base-delay(2), :max-delay(5), :jitter(0),
+		),
+		schedule-after => capturing-timer(@delays),
+	);
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(DieStep.new(:step-name('boom')));
+	{ $runner.run($plan, LLM::Data::Pipeline::Context.new); CATCH { default {} } }
+	is @delays.join(','), '2,4,5,5',
+		'Delays climb 2, 4 then flatten at the 5s cap';
+};
+
+subtest 'Default policy (max-attempts 1) rethrows the ORIGINAL exception' => {
+	plan 4;
+	my @events;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(CustomDieStep.new);
+
+	my $err;
+	{
+		$runner.run($plan, LLM::Data::Pipeline::Context.new);
+		CATCH { default { $err = $_ } }
+	}
+
+	ok $err ~~ X::Custom::Boom, 'Original typed exception flows out unchanged';
+	nok $err ~~ X::LLM::Data::Pipeline::StepExhausted, 'NOT wrapped in StepExhausted';
+
+	# No step-failed events on the single-attempt path — identical to Stage 2.
+	nok @events.grep(* ~~ LLM::Data::Pipeline::Event::StepFailed).elems,
+		'No step-failed events emitted with max-attempts 1';
+	is-deeply @events.map(*.kind).List, (
+		'run-started', 'step-started', 'run-failed',
+	), 'Single-attempt failure train matches the pre-retry contract';
+};
+
+subtest 'Default policy is the Runner default' => {
+	plan 2;
+	my LLM::Data::Pipeline::Runner $runner .= new;
+	is $runner.step-retry.max-attempts, 1, 'Default step-retry is single-attempt';
+	isa-ok $runner.step-retry, LLM::Data::Pipeline::RetryPolicy, 'It is a RetryPolicy';
+};
+
+subtest 'Resume after an exhausted run resumes at the failed step' => {
+	plan 5;
+	my IO::Path $cp = tmp-path('exhausted-resume.json');
+
+	# First run: step-a succeeds and checkpoints; step-b exhausts and aborts.
+	my LLM::Data::Pipeline::Runner $r1 .= new(
+		step-retry => LLM::Data::Pipeline::RetryPolicy.new(
+			:max-attempts(2), :base-delay(0), :jitter(0),
+		),
+		schedule-after => capturing-timer(my @ignore),
+	);
+	my LLM::Data::Pipeline::Plan $plan1 .= new;
+	$plan1.add-step(SetKeyStep.new(:step-name('a'), :key('x'), :val(1)));
+	$plan1.add-step(DieStep.new(:step-name('b')));
+
+	my $err;
+	{
+		$r1.run($plan1, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+		CATCH { default { $err = $_ } }
+	}
+	ok $err ~~ X::LLM::Data::Pipeline::StepExhausted, 'First run exhausted at step-b';
+
+	my %saved = from-json($cp.slurp);
+	is-deeply %saved<completed-steps>.List, ('a',),
+		'Checkpoint holds only the step that completed before the failure';
+	is %saved<context><x>, 1, 'step-a context persisted';
+
+	# Second run: step-b now succeeds; resume should skip a, run b.
+	my @events;
+	my LLM::Data::Pipeline::Runner $r2 .= new(
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my LLM::Data::Pipeline::Plan $plan2 .= new;
+	$plan2.add-step(SetKeyStep.new(:step-name('a'), :key('x'), :val(1)));
+	$plan2.add-step(SetKeyStep.new(:step-name('b'), :key('y'), :val(2)));
+	my LLM::Data::Pipeline::Context $resumed = $r2.resume($plan2, $cp);
+
+	is $resumed.get('y'), 2, 'Previously-failed step-b executed on resume';
+	is-deeply @events.map(*.kind).List, (
+		'run-started',
+		'step-skipped',
+		'step-started', 'checkpoint-written', 'step-completed',
+		'run-completed',
+	), 'Resume skips step-a and runs step-b';
+};
+
+subtest 'to-hash of Stage-3 events is JSON round-trippable' => {
+	plan 1;
+	my @events;
+	my LLM::Data::Pipeline::Runner $runner .= new(
+		step-retry => LLM::Data::Pipeline::RetryPolicy.new(
+			:max-attempts(2), :base-delay(0), :jitter(0),
+		),
+		schedule-after => capturing-timer(my @ignore),
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my LLM::Data::Pipeline::Plan $plan .= new;
+	$plan.add-step(DieStep.new(:step-name('boom')));
+	{ $runner.run($plan, LLM::Data::Pipeline::Context.new); CATCH { default {} } }
+
+	my $ok = True;
+	my %seen;
+	for @events -> LLM::Data::Pipeline::Event $e {
+		%seen{$e.kind} = True;
+		my %back = from-json(to-json($e.to-hash));
+		$ok = False unless %back<kind> eqv $e.kind;
+		$ok = False unless %back<seq>  eqv $e.seq;
+	}
+	$ok = False unless (%seen<step-failed>:exists) && (%seen<step-retry>:exists);
+	ok $ok, 'step-failed and step-retry round-trip through JSON';
+};
