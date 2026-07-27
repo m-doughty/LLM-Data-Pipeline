@@ -10,7 +10,7 @@ use PipelineTestKit;
 use JSON::Fast;
 use Digest::SHA256::Native;
 
-plan 7;
+plan 8;
 
 my IO::Path $tmpdir = $*TMPDIR.add("pipeline-items-resume-{$*PID}");
 $tmpdir.mkdir;
@@ -57,6 +57,50 @@ subtest 'Mid-step resume: recovers results, re-runs only pending' => {
 	is $step.exec-count-for('c'), 1, 'pending item c executed';
 	is $ctx.get('s/items')<a>, 'recovered-a', 'recovered result preserved verbatim';
 	is $ctx.get('s/items')<b>, 'ok-b', 'pending item produced fresh result';
+};
+
+subtest 'Activation progress on resume carries the rehydrated counts' => {
+	plan 4;
+	my IO::Path $cp = tmp('resume-progress.checkpoint.json');
+	# Hand-craft a v2 checkpoint: 'a' recorded done, 'b' dead, 'c'/'d' pending.
+	my %checkpoint = (
+		version         => 2,
+		run-id          => 'lineage-progress',
+		completed-steps => [],
+		context         => %(),
+		step-state      => %(
+			s => %(
+				fingerprint => %(
+					count        => 4,
+					keys-sha256  => keys-sha('a', 'b', 'c', 'd'),
+					items-sha256 => items-sha('a', 'b', 'c', 'd'),
+				),
+				done        => %( a => True ),
+				results     => %( a => 'recovered-a' ),
+				attempts    => %( a => 1, b => 3 ),
+				dead        => %( b => True ),
+				started-at  => '2026-07-19T00:00:00Z',
+			),
+		),
+		updated-at => '2026-07-19T00:00:00Z',
+	);
+	$cp.spurt(to-json(%checkpoint, :sorted-keys));
+
+	my $step = ScriptedItemStep.new(:step-name('s'), :item-list(<a b c d>), :content-keys);
+	my @events;
+	my $runner = LLM::Data::Pipeline::Runner.new(
+		:degree(1), on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	my $plan = LLM::Data::Pipeline::Plan.new; $plan.add-step($step);
+	$runner.resume($plan, $cp);
+
+	my $act = @events.first(* ~~ LLM::Data::Pipeline::Event::Progress);
+	my $first-item = @events.first(* ~~ LLM::Data::Pipeline::Event::ItemStarted);
+	is-deeply ($act.done, $act.dead, $act.total), (1, 1, 4),
+		'activation progress reports the rehydrated done/dead counts';
+	is $act.pending, 2, 'pending counts only the items not yet recorded';
+	is $act.in-flight, 0, 'nothing in flight at activation';
+	ok $act.seq < $first-item.seq, 'activation progress precedes the first resumed item-started';
 };
 
 subtest 'Drift guard: mismatched fingerprint throws CheckpointDrift' => {
@@ -182,7 +226,7 @@ subtest 'Kill-simulation: cancel mid-step, resume with a fresh Runner' => {
 };
 
 subtest 'Resume of a fully-completed item step is a no-op skip' => {
-	plan 2;
+	plan 4;
 	my IO::Path $cp = tmp('done.checkpoint.json');
 	my $step1 = ScriptedItemStep.new(:step-name('f'), :item-list(<a b c>), :content-keys);
 	my $r1 = LLM::Data::Pipeline::Runner.new(:degree(2));
@@ -190,11 +234,17 @@ subtest 'Resume of a fully-completed item step is a no-op skip' => {
 	$r1.run($p1, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
 
 	my $step2 = ScriptedItemStep.new(:step-name('f'), :item-list(<a b c>), :content-keys);
-	my $r2 = LLM::Data::Pipeline::Runner.new(:degree(2));
+	my @events;
+	my $r2 = LLM::Data::Pipeline::Runner.new(
+		:degree(2), on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
 	my $p2 = LLM::Data::Pipeline::Plan.new; $p2.add-step($step2);
 	my $ctx = $r2.resume($p2, $cp);
 	is $step2.executed-keys.elems, 0, 'no items re-run';
 	is $ctx.get('f/items').keys.elems, 3, 'results carried through resume';
+	is @events.grep(* ~~ LLM::Data::Pipeline::Event::StepSkipped).elems, 1, 'step skipped by name';
+	is @events.grep(* ~~ LLM::Data::Pipeline::Event::Progress).elems, 0,
+		'a step skipped as complete never activates, so emits no progress';
 };
 
 subtest 'run-id lineage is stable across resume' => {

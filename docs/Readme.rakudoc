@@ -264,11 +264,16 @@ item-completed       | ItemCompleted     | step, key, attempt, duration         
 item-failed          | ItemFailed        | step, key, attempt, error, exception                       | emitted (0.4.0)
 item-dead-lettered   | ItemDeadLettered  | step, key, attempts, error                                 | emitted (0.4.0)
 item-requeued        | ItemRequeued      | step, key                                                  | emitted (0.4.0)
-progress             | Progress          | step, done, dead, total, in-flight, pending                | emitted (0.4.0)
+progress             | Progress          | step, done, dead, total, in-flight, pending                | emitted (0.4.0; also at activation from 0.5.1)
 run-cancelled        | RunCancelled      | step, items-done, items-dead                               | emitted (0.4.0)
 telemetry            | Telemetry         | step, key, stage, data                                     | emitted (0.4.0)
 run-retry            | RunRetry          | attempt, max-attempts, delay, error, exception             | emitted (0.5.0)
 =end table
+
+An item step emits one C<progress> at B<activation> (from C<0.5.1>), before its
+first C<item-started>, so a progress bar can show C<0/N> for a fresh stage and
+C<done/N> for a resumed one immediately instead of staying blank until the
+stage's first item finishes.
 
 =head2 LLM::Data::Pipeline::Step::Items
 

@@ -620,6 +620,14 @@ method !run-item-step(
 	# buffers more than $degree jobs.
 	my Str @ready = @keys.grep({ !(%done{$_}:exists) && !(%dead{$_}:exists) }).list;
 
+	# Activation snapshot: one progress event the instant the step becomes active,
+	# BEFORE the first dispatch — so a consumer sees 0/N for a fresh stage and
+	# done/N for a resumed one without waiting for the first item terminal.
+	# Nothing is in flight yet, so in-flight is 0 and pending is everything not
+	# already recorded; the shared helper keeps the payload semantics identical to
+	# the terminal-driven emissions.
+	emit-progress();
+
 	my sub dispatch(Str:D $key) {
 		my Int $attempt = (%attempts{$key} // 0) + 1;
 		%in-flight{$key} = True;
@@ -1076,6 +1084,11 @@ detail. It will be removed at C<1.0>; migrate to C<&.on-event>.
       C<1>, no gaps).
 =item C<step-started> precedes its item events, which precede that step's
       C<step-completed>/C<step-failed> (item events arrive from C<0.4.0>).
+=item An item step's first item event is a C<progress> B<activation snapshot>
+      (from C<0.5.1>): it is emitted before the first C<item-started>, so a
+      consumer can render C<0/N> (fresh) or C<done/N> (resumed) the moment the
+      stage activates. A step skipped as already-complete on resume never
+      activates and emits none.
 =item Cross-item ordering is defined B<only by C<seq>> — do not infer any other
       relationship between events of different items.
 

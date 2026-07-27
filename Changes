@@ -2,6 +2,18 @@ Revision history for LLM::Data::Pipeline
 
 {{$NEXT}}
 
+0.5.1  2026-07-27T15:27:05+01:00
+    - Item steps now emit one progress event at ACTIVATION (2026-07-26): the
+      Runner emits it as soon as the step's item set is materialized and the
+      ready queue is computed, before the first dispatch, so a consumer sees
+      0/N for a fresh stage and done/N for a resumed one instead of nothing
+      until the stage's first item terminal. in-flight is 0 and pending covers
+      everything not already recorded in the checkpoint; payload semantics are
+      otherwise identical to the terminal-driven emissions (same helper).
+    - Ordering: an item step's activation progress precedes its first
+      item-started. A step skipped as already-complete on resume never
+      activates and emits no progress.
+
 0.5.0  2026-07-21T03:12:48+01:00
     - run-until-done: whole-run supervision that resumes a pipeline to completion
       across process-local retries (attempt 1 resumes an existing checkpoint,

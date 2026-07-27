@@ -8,7 +8,7 @@ use LLM::Data::Pipeline::Step::Items;
 use LLM::Data::Pipeline::Event;
 use PipelineTestKit;
 
-plan 8;
+plan 10;
 
 sub run-step(ScriptedItemStep $step, :$degree = 4, :@extra-steps, :$ctx = LLM::Data::Pipeline::Context.new) {
 	my @events;
@@ -124,8 +124,37 @@ subtest 'Progress payload includes pending and is consistent' => {
 	my $step = ScriptedItemStep.new(:step-name('pg'), :item-list((1,2,3,4,5)));
 	my ($ctx, @events) := run-step($step, :degree(1));
 	my @progress = @events.grep(* ~~ LLM::Data::Pipeline::Event::Progress);
-	is @progress.elems, 5, 'one progress per terminal transition';
+	is @progress.elems, 6, 'one progress at activation plus one per terminal transition';
 	ok @progress.tail.done == 5, 'final progress shows all done';
+};
+
+subtest 'Activation progress precedes the first item-started' => {
+	plan 5;
+	my $step = ScriptedItemStep.new(:step-name('act'), :item-list(<a b c d>), :content-keys);
+	my ($ctx, @events) := run-step($step, :degree(2));
+	my @progress = @events.grep(* ~~ LLM::Data::Pipeline::Event::Progress);
+	my $act = @progress.head;
+	my $step-started = @events.first(* ~~ LLM::Data::Pipeline::Event::StepStarted);
+	my $first-item = @events.first(* ~~ LLM::Data::Pipeline::Event::ItemStarted);
+	ok $act.seq > $step-started.seq, 'activation progress follows step-started';
+	ok $act.seq < $first-item.seq, 'activation progress precedes the first item-started';
+	is-deeply ($act.done, $act.dead, $act.total), (0, 0, 4), 'fresh stage activates at 0/N';
+	is-deeply ($act.in-flight, $act.pending), (0, 4),
+		'nothing in flight at activation; every item pending';
+	is @progress.elems, 5, 'activation snapshot plus one progress per item terminal';
+};
+
+subtest 'Activation progress for an empty item set is the only progress' => {
+	plan 3;
+	my $step = ScriptedItemStep.new(:step-name('none'), :item-list(()));
+	my ($ctx, @events) := run-step($step, :degree(2));
+	my @progress = @events.grep(* ~~ LLM::Data::Pipeline::Event::Progress);
+	is @progress.elems, 1, 'an itemless step still activates exactly once';
+	is-deeply
+		(@progress[0].done, @progress[0].dead, @progress[0].total, @progress[0].pending),
+		(0, 0, 0, 0),
+		'activation reports 0/0 with nothing pending';
+	is $ctx.get('none/items').elems, 0, 'no item results recorded';
 };
 
 subtest 'degree 1 and degree 4 yield identical final state' => {

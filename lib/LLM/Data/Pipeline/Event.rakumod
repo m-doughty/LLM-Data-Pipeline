@@ -268,7 +268,9 @@ class LLM::Data::Pipeline::Event::ItemRequeued does LLM::Data::Pipeline::Event {
 	}
 }
 
-#| Progress snapshot for a Step::Items step, emitted after every item terminal
+#| Progress snapshot for a Step::Items step, emitted once at step activation
+#| (since 0.5.1 — before the first C<item-started>, with C<in-flight> 0 and the
+#| counts rehydrated from the checkpoint) and then after every item terminal
 #| transition. C<pending> = total − done − dead − in-flight (items awaiting
 #| dispatch or a retry timer).
 class LLM::Data::Pipeline::Event::Progress does LLM::Data::Pipeline::Event {
@@ -409,7 +411,7 @@ my %back = from-json($json);     # %back<kind>, %back<seq>, %back<run-id>, %back
 
 =head1 EVENT TAXONOMY
 
-Every kind in the taxonomy is emitted as of this release (0.5.0). Earlier
+Every kind in the taxonomy is emitted as of this release (0.5.1). Earlier
 releases emitted a growing subset; the C<Status> column records when each kind
 first shipped.
 
@@ -436,7 +438,7 @@ item-completed       | ItemCompleted     | step, key, attempt, duration         
 item-failed          | ItemFailed        | step, key, attempt, error, exception                    | emitted (0.4.0)
 item-dead-lettered   | ItemDeadLettered  | step, key, attempts, error                              | emitted (0.4.0)
 item-requeued        | ItemRequeued      | step, key                                               | emitted (0.4.0)
-progress             | Progress          | step, done, dead, total, in-flight, pending             | emitted (0.4.0)
+progress             | Progress          | step, done, dead, total, in-flight, pending             | emitted (0.4.0; also at activation from 0.5.1)
 run-cancelled        | RunCancelled      | step, items-done, items-dead                            | emitted (0.4.0)
 telemetry            | Telemetry         | step, key, stage, data                                  | emitted (0.4.0)
 run-retry            | RunRetry          | attempt, max-attempts, delay, error, exception          | emitted (0.5.0)
@@ -445,6 +447,25 @@ run-retry            | RunRetry          | attempt, max-attempts, delay, error, 
 The C<step-completed> C<items-done>/C<items-dead> fields are present only for
 C<Step::Items> steps (omitted for plain steps). C<checkpoint-written> C<trigger>
 is one of C<'step'>, C<'item'>, C<'dead-letter'>, or C<'cancel'>.
+
+C<progress> is emitted B<once at item-step activation> as well (since C<0.5.1>):
+before the step's first C<item-started>, carrying C<in-flight> C<0>, the C<done>
+and C<dead> counts rehydrated from the checkpoint, and C<pending> for everything
+not yet recorded. So a fresh stage reports C<0/N> and a resumed one C<done/N> the
+moment it activates, instead of nothing until its first item finishes:
+
+=begin code :lang<raku>
+
+when LLM::Data::Pipeline::Event::Progress {
+	# Fires immediately on activation, then after every item terminal.
+	say sprintf('%s %d/%d (%d dead, %d in flight)',
+		$e.step, $e.done, $e.total, $e.dead, $e.in-flight);
+}
+
+=end code
+
+A step skipped as already-complete on resume never activates, so it emits no
+C<progress> at all — C<step-skipped> is the only thing a consumer sees for it.
 
 All C<duration> and C<delay> fields are seconds as a number; C<checkpoint-path>
 is C<Str> and may be the (undefined) type object when no checkpoint path was
