@@ -1,0 +1,434 @@
+use Test;
+use lib 'lib', 't/lib';
+use LLM::Data::Pipeline::Runner;
+use LLM::Data::Pipeline::Plan;
+use LLM::Data::Pipeline::Context;
+use LLM::Data::Pipeline::Event;
+use LLM::Data::Pipeline::Exceptions;
+use LLM::Data::Pipeline::RetryPolicy;
+use PipelineTestKit;
+use JSON::Fast;
+use Digest::SHA256::Native;
+
+plan 10;
+
+my IO::Path $tmpdir = $*TMPDIR.add("pipeline-items-partial-{$*PID}");
+$tmpdir.mkdir;
+END { $tmpdir.dir>>.unlink if $tmpdir.d; $tmpdir.rmdir if $tmpdir.d; }
+sub tmp(Str:D $n) { $tmpdir.add($n) }
+
+sub keys-sha(*@keys)   { sha256-hex(to-json(@keys.list, :sorted-keys)) }
+sub items-sha(*@items) { sha256-hex(to-json(@items.list, :sorted-keys)) }
+
+#| A retry policy with no real sleep in it (the seam fires instantly, this
+#| just sets the budget).
+sub tries(Int:D $n) {
+	LLM::Data::Pipeline::RetryPolicy.new(
+		:max-attempts($n), :base-delay(0), :jitter(0),
+	);
+}
+
+#| Build a Runner + single-step Plan whose step already knows the Runner (it
+#| needs it to mint a partial-sink). Returns C<($runner, $plan, $step)>.
+sub wire($step, *%runner-args) {
+	my $runner = LLM::Data::Pipeline::Runner.new(|%runner-args);
+	$step.runner = $runner;
+	my $plan = LLM::Data::Pipeline::Plan.new;
+	$plan.add-step($step);
+	($runner, $plan, $step);
+}
+
+#| Run C<&body> with C<note> output captured to a file, and return everything
+#| it wrote. The drops this feature defends against are deliberately quiet
+#| (a note, not a throw), so the note IS the observable.
+sub capture-notes(&body --> Str) {
+	my IO::Path $log = tmp("notes-{$++}.txt");
+	{
+		my $*ERR = open($log, :w);
+		LEAVE { try $*ERR.close }
+		body();
+	}
+	$log.e ?? $log.slurp !! '';
+}
+
+subtest 'An item retry resumes from the partial and re-runs no sub-unit' => {
+	plan 6;
+	# Five sequential sub-units; the one at index 3 throws once. Before
+	# partials this cost the item units 0..2 a second time — the live
+	# failure this feature exists to fix.
+	my $step = ScriptedItemStep.new(
+		:step-name('s'), :item-list(<a>), :content-keys,
+		script => %( a => %( kind => 'sub-fail', units => 5,
+		                     fail-at => 3, fail-times => 1 ) ),
+		:step-item-retry(tries(2)),
+	);
+	my ($seam, @delays) := instant-timer();
+	my ($runner, $plan, $) = wire($step, :degree(1), schedule-after => $seam);
+	my $ctx = LLM::Data::Pipeline::Context.new;
+	$runner.run($plan, $ctx);
+
+	is $step.exec-count-for('a'), 2, 'the item itself was attempted twice';
+	is $step.sub-exec-count-for('a'), 5,
+		'but only five SUB-UNITS ran in total — none was re-executed';
+	is-deeply $step.received-partial-for('a')<next>, 3,
+		'the retry was handed the partial the failed attempt had saved';
+	is-deeply $step.received-partial-for('a')<log>.list.List,
+		('a-0', 'a-1', 'a-2'),
+		'carrying the sub-units already completed';
+	is $ctx.get('s/items')<a>, 'a-0,a-1,a-2,a-3,a-4',
+		'the result spans every sub-unit exactly once, in order';
+	is @delays.elems, 1, 'one item-level backoff, not one per sub-unit';
+};
+
+subtest 'A fresh item is handed an empty partial' => {
+	plan 3;
+	my $step = ScriptedItemStep.new(
+		:step-name('s'), :item-list(<a b>), :content-keys,
+		script => %( a => %( kind => 'sub-fail', units => 2 ) ),
+	);
+	my ($runner, $plan, $) = wire($step, :degree(1));
+	$runner.run($plan, LLM::Data::Pipeline::Context.new);
+
+	is-deeply $step.received-partial-for('a').Hash, %(),
+		'a first attempt sees %() — the "start from the beginning" signal';
+	is-deeply $step.received-partial-for('b').Hash, %(),
+		'and so does an item whose step never saves at all';
+	is $step.sub-exec-count-for('a'), 2, 'both sub-units ran';
+};
+
+subtest 'Cancel mid-item: the checkpoint carries the partial, a fresh Runner resumes it' => {
+	plan 7;
+	my IO::Path $cp = tmp('cancel.checkpoint.json');
+
+	# 'a' is six sub-units and always throws at index 3. Cancellation is
+	# requested once three partials have been persisted, so by the time the
+	# failure arrives the run is draining: the item is neither retried nor
+	# dead-lettered, it stays pending — WITH its partial. That is the whole
+	# payoff of accepting saves during a cancel drain.
+	my Int $saves = 0;
+	my $step1 = ScriptedItemStep.new(
+		:step-name('s'), :item-list(<a b>), :content-keys,
+		script => %( a => %( kind => 'sub-fail', units => 6,
+		                     fail-at => 3, fail-times => 99 ) ),
+		:step-item-retry(tries(3)),
+	);
+	my ($seam, @) := instant-timer();
+	my ($r1, $p1, $) = wire(
+		$step1,
+		:degree(1), schedule-after => $seam,
+		is-cancelled => -> { $saves >= 3 },
+		on-event => -> LLM::Data::Pipeline::Event $e {
+			$saves++ if $e ~~ LLM::Data::Pipeline::Event::CheckpointWritten
+			         && $e.trigger eq 'partial';
+		},
+	);
+	my $err;
+	{
+		$r1.run($p1, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+		CATCH { default { $err = $_ } }
+	}
+	ok $err ~~ X::LLM::Data::Pipeline::Cancelled, 'the run cancelled';
+	is $step1.sub-exec-count-for('a'), 3, 'three sub-units completed before the cancel';
+
+	my %ck = from-json($cp.slurp);
+	my %state = %ck<step-state><s>;
+	is %state<partials><a><next>, 3, 'the checkpoint carries the item partial';
+	nok %state<done><a>, 'the item is NOT recorded done';
+	nok (%state<dead> // %())<a>, 'and NOT dead-lettered — it stays pending';
+
+	# Second, FRESH Runner: same step definition, but the transient sub-unit
+	# fault is gone.
+	my $step2 = ScriptedItemStep.new(
+		:step-name('s'), :item-list(<a b>), :content-keys,
+		script => %( a => %( kind => 'sub-fail', units => 6, fail-at => -1 ) ),
+	);
+	my ($r2, $p2, $) = wire($step2, :degree(1));
+	my $ctx = $r2.resume($p2, $cp);
+
+	is $step2.sub-exec-count-for('a'), 3,
+		'the resume ran only the three sub-units the kill had not covered';
+	is $ctx.get('s/items')<a>, 'a-0,a-1,a-2,a-3,a-4,a-5',
+		'and the finished result spans every sub-unit exactly once';
+};
+
+subtest 'A terminal item carries no partial: cleared on success and on dead-letter' => {
+	plan 5;
+	my IO::Path $ok-cp = tmp('clear-ok.checkpoint.json');
+	my $ok-step = ScriptedItemStep.new(
+		:step-name('s'), :item-list(<a>), :content-keys,
+		script => %( a => %( kind => 'sub-fail', units => 4 ) ),
+	);
+	my ($r1, $p1, $) = wire($ok-step, :degree(1));
+	$r1.run($p1, LLM::Data::Pipeline::Context.new, :checkpoint-path($ok-cp));
+
+	my %ok = from-json($ok-cp.slurp);
+	is-deeply (%ok<step-state><s><partials> // %()).Hash, %(),
+		'a completed step carries no partials at all';
+	ok %ok<step-state><s><done><a>, 'the item is recorded done';
+
+	my IO::Path $dead-cp = tmp('clear-dead.checkpoint.json');
+	my $dead-step = ScriptedItemStep.new(
+		:step-name('s'), :item-list(<a>), :content-keys,
+		script => %( a => %( kind => 'sub-fail', units => 4,
+		                     fail-at => 2, fail-times => 99 ) ),
+		:step-item-retry(tries(2)),
+	);
+	my ($seam, @) := instant-timer();
+	my ($r2, $p2, $) = wire($dead-step, :degree(1), schedule-after => $seam);
+	$r2.run($p2, LLM::Data::Pipeline::Context.new, :checkpoint-path($dead-cp));
+
+	my %dead = from-json($dead-cp.slurp);
+	ok %dead<step-state><s><dead><a>, 'the item dead-lettered';
+	is-deeply (%dead<step-state><s><partials> // %()).Hash, %(),
+		'and its partial is gone — a requeue must re-run it from the start';
+	is $dead-step.sub-exec-count-for('a'), 2,
+		'the doomed retry resumed AT the failing sub-unit rather than '
+		~ 're-running the two before it';
+};
+
+subtest 'A pre-0.6.0 v2 checkpoint (no partials key) resumes as a fresh start' => {
+	plan 3;
+	my IO::Path $cp = tmp('legacy.checkpoint.json');
+	# Exactly the shape 0.5.1 wrote: step-state with no `partials` key.
+	$cp.spurt(to-json(%(
+		version         => 2,
+		run-id          => 'lineage-legacy',
+		completed-steps => [],
+		context         => %(),
+		step-state      => %(
+			s => %(
+				fingerprint => %(
+					count        => 2,
+					keys-sha256  => keys-sha('a', 'b'),
+					items-sha256 => items-sha('a', 'b'),
+				),
+				done       => %( a => True ),
+				results    => %( a => 'recovered-a' ),
+				attempts   => %( a => 1 ),
+				dead       => %(),
+				started-at => '2026-07-27T00:00:00Z',
+			),
+		),
+		updated-at => '2026-07-27T00:00:00Z',
+	), :sorted-keys));
+
+	my $step = ScriptedItemStep.new(
+		:step-name('s'), :item-list(<a b>), :content-keys,
+		script => %( b => %( kind => 'sub-fail', units => 3 ) ),
+	);
+	my ($runner, $plan, $) = wire($step, :degree(1));
+	my $ctx = $runner.resume($plan, $cp);
+
+	is-deeply $step.received-partial-for('b').Hash, %(),
+		'an absent partials key reads as "nothing saved"';
+	is $step.sub-exec-count-for('b'), 3, 'so the pending item runs every sub-unit';
+	is $ctx.get('s/items')<a>, 'recovered-a', 'and the rehydrated result is untouched';
+};
+
+subtest 'Partial writes ride the coalescing gate; a resume redoes only the unpersisted tail' => {
+	plan 4;
+	my IO::Path $cp   = tmp('throttle.checkpoint.json');
+	my IO::Path $snap = tmp('throttle-snapshot.checkpoint.json');
+
+	# checkpoint-every 3 over five sub-unit saves plus one item terminal:
+	# writes land on the 3rd and 6th gate calls, so exactly ONE of the five
+	# saves is persisted at the moment it happens.
+	my $step1 = ScriptedItemStep.new(
+		:step-name('s'), :item-list(<a>), :content-keys,
+		script => %( a => %( kind => 'sub-fail', units => 5 ) ),
+	);
+	my Int $partial-writes = 0;
+	my ($r1, $p1, $) = wire(
+		$step1,
+		:degree(1), :checkpoint-every(3),
+		on-event => -> LLM::Data::Pipeline::Event $e {
+			if $e ~~ LLM::Data::Pipeline::Event::CheckpointWritten
+			   && $e.trigger eq 'partial' {
+				$partial-writes++;
+				# Freeze the FIRST throttled write: this is exactly the file
+				# a kill one sub-unit later would leave behind.
+				$cp.copy($snap) if $partial-writes == 1;
+			}
+		},
+	);
+	$r1.run($p1, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+
+	is $partial-writes, 1,
+		'five saves produced one checkpoint write under checkpoint-every 3';
+	my %snapped = from-json($snap.slurp);
+	is %snapped<step-state><s><partials><a><next>, 3,
+		'the snapshot holds the partial as of the throttled write';
+
+	# Resume the FROZEN file with a fresh Runner: the two sub-units that ran
+	# after the last persisted save are the only redo, which is precisely the
+	# window coalescing widens.
+	my $step2 = ScriptedItemStep.new(
+		:step-name('s'), :item-list(<a>), :content-keys,
+		script => %( a => %( kind => 'sub-fail', units => 5 ) ),
+	);
+	my ($r2, $p2, $) = wire($step2, :degree(1));
+	my $ctx = $r2.resume($p2, $snap);
+	is $step2.sub-exec-count-for('a'), 2,
+		'the resume re-ran only the unpersisted sub-units';
+	is $ctx.get('s/items')<a>, 'a-0,a-1,a-2,a-3,a-4',
+		'and still produced the whole item';
+};
+
+subtest 'Misdirected saves are dropped: wrong step, and a key already terminal' => {
+	plan 6;
+	# A step that saves through a sink minted for ANOTHER step's name — the
+	# late-callback hazard telemetry-sink already defends against.
+	my class WrongStepSaver does LLM::Data::Pipeline::Step::Items {
+		has $.runner is rw;
+		method name(--> Str:D) { 'w' }
+		method description(--> Str:D) { 'saves to the wrong step' }
+		method provides(--> List) { ('w/items',) }
+		method items($ctx --> Iterable) { <a>.list }
+		method item-key(Int:D $i, $item --> Str:D) { $item }
+		method process-item($ctx, $item, Str:D $key, :%partial --> Any) {
+			$!runner.partial-sink(step => 'some-other-step', :$key).(
+				%( next => 1 ));
+			'done';
+		}
+	}
+	my IO::Path $cp1 = tmp('wrong-step.checkpoint.json');
+	my Int $writes1 = 0;
+	my $wrong = WrongStepSaver.new;
+	my ($r1, $p1, $) = wire(
+		$wrong, :degree(1),
+		on-event => -> LLM::Data::Pipeline::Event $e {
+			$writes1++ if $e ~~ LLM::Data::Pipeline::Event::CheckpointWritten
+			           && $e.trigger eq 'partial';
+		},
+	);
+	my $notes1 = capture-notes({
+		$r1.run($p1, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp1));
+	});
+	like $notes1, /"partial for step 'some-other-step'"/,
+		'the misdirected save is reported';
+	is $writes1, 0, 'and never reaches the partial store';
+	is-deeply (from-json($cp1.slurp)<step-state><w><partials> // %()).Hash, %(),
+		'the checkpoint carries no partial for it';
+
+	# A save naming an item that is already recorded done. With degree 1 the
+	# ordering is deterministic: 'a' completes, then 'b' saves against 'a'.
+	my class StaleKeySaver does LLM::Data::Pipeline::Step::Items {
+		has $.runner is rw;
+		method name(--> Str:D) { 's' }
+		method description(--> Str:D) { 'saves against a finished item' }
+		method provides(--> List) { ('s/items',) }
+		method items($ctx --> Iterable) { <a b>.list }
+		method item-key(Int:D $i, $item --> Str:D) { $item }
+		method degree(--> UInt:D) { 1 }
+		method process-item($ctx, $item, Str:D $key, :%partial --> Any) {
+			$!runner.partial-sink(step => 's', key => 'a').(%( next => 99 ))
+				if $key eq 'b';
+			"ok-$key";
+		}
+	}
+	my IO::Path $cp2 = tmp('stale-key.checkpoint.json');
+	my Int $writes2 = 0;
+	my $stale = StaleKeySaver.new;
+	my ($r2, $p2, $) = wire(
+		$stale, :degree(1),
+		on-event => -> LLM::Data::Pipeline::Event $e {
+			$writes2++ if $e ~~ LLM::Data::Pipeline::Event::CheckpointWritten
+			           && $e.trigger eq 'partial';
+		},
+	);
+	my $ctx = $r2.run($p2, LLM::Data::Pipeline::Context.new,
+	                  :checkpoint-path($cp2));
+	is $writes2, 0,
+		'a save for an already-recorded key is dropped, not stored';
+	is $ctx.get('s/items')<a>, 'ok-a',
+		"and cannot resurrect state over the finished item's result";
+	is-deeply (from-json($cp2.slurp)<step-state><s><partials> // %()).Hash, %(),
+		'the completed step still carries no partials';
+};
+
+subtest 'retry-dead requeues a formerly-partialed item from scratch' => {
+	plan 4;
+	my IO::Path $cp = tmp('retrydead.checkpoint.json');
+	my $step1 = ScriptedItemStep.new(
+		:step-name('s'), :item-list(<a>), :content-keys,
+		script => %( a => %( kind => 'sub-fail', units => 4,
+		                     fail-at => 2, fail-times => 99 ) ),
+		:step-item-retry(tries(2)),
+	);
+	my ($seam, @) := instant-timer();
+	my ($r1, $p1, $) = wire($step1, :degree(1), schedule-after => $seam);
+	$r1.run($p1, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+
+	my %ck = from-json($cp.slurp);
+	ok %ck<step-state><s><dead><a>, 'the item is dead-lettered';
+
+	# Inject a stale partial the dead arm would never have left behind (an
+	# older lineage, or a hand-edited checkpoint). apply-retry-dead must
+	# clear it, or the requeued item would resume INTO the failure it was
+	# requeued to escape.
+	%ck<step-state><s><partials> = %( a => %( next => 2,
+	                                          log => ['a-0', 'a-1'] ) );
+	$cp.spurt(to-json(%ck, :sorted-keys));
+
+	my $step2 = ScriptedItemStep.new(
+		:step-name('s'), :item-list(<a>), :content-keys,
+		script => %( a => %( kind => 'sub-fail', units => 4, fail-at => -1 ) ),
+	);
+	my ($r2, $p2, $) = wire($step2, :degree(1));
+	my $ctx = $r2.resume($p2, $cp, :retry-dead);
+
+	is-deeply $step2.received-partial-for('a').Hash, %(),
+		'the requeued item starts fresh, with no partial handed back';
+	is $step2.sub-exec-count-for('a'), 4, 'so every sub-unit re-runs';
+	is $ctx.get('s/items')<a>, 'a-0,a-1,a-2,a-3',
+		'and the repaired item produces the whole result';
+};
+
+subtest 'Partials add no event kind and leave seq contiguous' => {
+	plan 4;
+	my IO::Path $cp = tmp('events.checkpoint.json');
+	my @events;
+	my $step = ScriptedItemStep.new(
+		:step-name('s'), :item-list(<a b>), :content-keys,
+		script => %(
+			a => %( kind => 'sub-fail', units => 3, fail-at => 1, fail-times => 1 ),
+			b => %( kind => 'sub-fail', units => 2 ),
+		),
+		:step-item-retry(tries(2)),
+	);
+	my ($seam, @) := instant-timer();
+	my ($runner, $plan, $) = wire(
+		$step, :degree(1), schedule-after => $seam,
+		on-event => -> LLM::Data::Pipeline::Event $e { @events.push($e) },
+	);
+	$runner.run($plan, LLM::Data::Pipeline::Context.new, :checkpoint-path($cp));
+
+	my $known = <run-started step-started progress item-started item-completed
+	             item-failed checkpoint-written step-completed
+	             run-completed>.Set;
+	is-deeply @events.map(*.kind).grep({ !($_ (elem) $known) }).List, (),
+		'no new event kind appears — a partial is state, not an event';
+	is-deeply @events.map(*.seq).List, (1 .. @events.elems).List,
+		'seq stays contiguous from 1';
+	ok @events.grep({
+		$_ ~~ LLM::Data::Pipeline::Event::CheckpointWritten
+		&& .trigger eq 'partial'
+	}).elems > 0, "the 'partial' trigger is used";
+	is-deeply @events.grep(* ~~ LLM::Data::Pipeline::Event::CheckpointWritten)
+	                 .map(*.trigger).unique.sort.List,
+		('item', 'partial', 'step'),
+		'and it sits alongside the existing triggers';
+};
+
+subtest 'A sink minted with no active item step drops with a note' => {
+	plan 3;
+	my $runner = LLM::Data::Pipeline::Runner.new;
+	my &sink = $runner.partial-sink(step => 's', key => '0');
+	ok &sink.defined, 'a sink is still handed back outside a run';
+	my $notes = capture-notes({
+		lives-ok { sink(%( next => 1 )) },
+			'calling it cannot break the caller';
+	});
+	like $notes, /'no active item step'/,
+		'the drop is reported rather than silent';
+};

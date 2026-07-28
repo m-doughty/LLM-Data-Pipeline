@@ -2,6 +2,58 @@ Revision history for LLM::Data::Pipeline
 
 {{$NEXT}}
 
+0.6.0  2026-07-28T01:44:53+01:00
+    - RESUMABLE ITEMS (2026-07-28): an item that is a run of sequential
+      sub-units can now persist its progress DURING the item, and is handed it
+      back on the next attempt. The motivating failure: one item was an 89-turn
+      chapter rewrite, so a turn failing mid-item made the retry re-run all 89
+      turns from the first — the sub-unit counter visibly restarted.
+      - Runner.partial-sink(:$step!, :$key!) mints a thread-safe save closure
+        for one item (a Channel send, safe from the worker thread), binding the
+        active inbox AT MINT TIME exactly as telemetry-sink does — so a late
+        save from an abandoned attempt can never land in another step's store.
+      - process-item receives the last saved Hash as :%partial (%() = start
+        fresh). It is a NAMED argument, so every pre-0.6.0 implementation keeps
+        working unchanged via its implicit *%_.
+      - Partials are deliberately NOT events: one can be an item's entire
+        generated output, which has no business on the on-event stream or in
+        the dead-letter journal. No new event kind; seq stays contiguous.
+      - Persistence rides the existing coalescing gate with a fifth trigger
+        string, 'partial', UNFORCED — so checkpoint-every / checkpoint-interval
+        throttle it like item terminals. This is sound because an in-process
+        retry is handed the IN-MEMORY partial and never reads the checkpoint:
+        coalescing can only widen the kill-resume redo window, never the retry
+        one.
+      - Every partial is normalized through JSON at receipt, so what a retry
+        gets from memory is identical to what a resume gets off disk; a partial
+        that cannot round-trip fails loudly at its first save.
+      - Clearing: on item success, on dead-letter, on a retry-dead requeue
+        (belt and braces — the dead arm already dropped it), and when
+        retry-dead reopens a completed step. A completed step's step-state
+        carries "partials": {}. Saves naming another step, or a key that is
+        already terminal, are dropped with a note.
+      - Cancellation KEEPS accepting partials: a run cancelled 60 turns into a
+        chunk resumes at turn 61. That is the payoff, not a leak.
+    - Checkpoint format stays v2 — partials are purely additive. A pre-0.6.0
+      checkpoint loads with every item starting fresh, and a 0.6.0 checkpoint
+      loads into an older Runner, which ignores the key.
+    - at-least-once now narrows to the SUB-UNIT boundary for steps that save:
+      sub-units covered by a persisted partial are not re-run, the ones after
+      the last save are, and external side effects must still be idempotent.
+    - Pod6: a "Resumable items" section in the Runner (contract, cadence,
+      clearing rules, normalization, checkpoint-size trade-off), the same
+      contract from the implementor's side in Step::Items (including "treat an
+      unrecognised partial as absent, never die"), the checkpoint v2 example
+      and the event-taxonomy trigger list.
+    - Tests: t/08-items-partial.rakutest (10 subtests) — retry resumes with no
+      sub-unit re-run, fresh items get %(), cancel-then-resume across two
+      Runners, clearing on success/dead, pre-0.6.0 checkpoints, coalescing plus
+      a frozen mid-run checkpoint proving the resume redoes only the
+      unpersisted tail, wrong-step and terminal-key drops, retry-dead over an
+      injected stale partial, event-kind/seq invariance, and the no-active-step
+      drop. PipelineTestKit's ScriptedItemStep grows a 'sub-fail' script kind
+      plus received-partial-for / sub-exec-count-for.
+
 0.5.1  2026-07-27T15:27:05+01:00
     - Item steps now emit one progress event at ACTIVATION (2026-07-26): the
       Runner emits it as soon as the step's item set is materialized and the

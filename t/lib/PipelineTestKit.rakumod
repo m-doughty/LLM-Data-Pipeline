@@ -14,6 +14,12 @@ unit module PipelineTestKit;
 #|   { kind => 'flaky', fails => N }               → throws N times, then succeeds
 #|   { kind => 'block-on', promise => $p }         → awaits $p, then succeeds
 #|   { kind => 'block-then-die', promise => $p }   → awaits $p, then throws
+#|   { kind => 'sub-fail', units => N,
+#|     fail-at => K, fail-times => M }             → N sequential SUB-UNITS,
+#|       saving a partial after each completed one via C<$.runner>'s
+#|       partial-sink; the sub-unit at index K throws on the first M attempts
+#|       that reach it. The result is the joined sub-unit log, so a resumed
+#|       item's result proves which sub-units it carried over.
 #| A missing script entry defaults to 'succeed'.
 class ScriptedItemStep does LLM::Data::Pipeline::Step::Items is export {
 	has Str:D  $.step-name is required;
@@ -27,6 +33,13 @@ class ScriptedItemStep does LLM::Data::Pipeline::Step::Items is export {
 	has        &.finalizer;
 	has Lock   $.lock = Lock.new;
 	has        %!exec-count;
+	#| The Runner driving this step, needed to mint a partial-sink. Settable
+	#| after construction because the Runner and the step are built in either
+	#| order (and a step under direct unit test has none at all).
+	has        $.runner is rw;
+	has        %!received-partial;   # key => the :%partial the last attempt saw
+	has        %!sub-exec;           # key => sub-units actually executed
+	has        %!sub-fail-count;     # "key/unit" => times that unit has thrown
 
 	method name(--> Str:D) { $!step-name }
 	method description(--> Str:D) { "scripted $!step-name" }
@@ -52,8 +65,25 @@ class ScriptedItemStep does LLM::Data::Pipeline::Step::Items is export {
 		$!lock.protect({ %!exec-count.keys.sort.list })
 	}
 
-	method process-item(LLM::Data::Pipeline::Context:D $ctx, $item, Str:D $key --> Any) {
-		my Int $n = $!lock.protect({ ++%!exec-count{$key} });
+	#| The C<:%partial> the most recent C<process-item> for C<$key> was handed
+	#| (C<%()> when it was handed none, C<Nil> when the key never ran).
+	method received-partial-for(Str:D $key) {
+		$!lock.protect({ %!received-partial{$key} })
+	}
+
+	#| How many SUB-UNITS were actually executed for C<$key> across every
+	#| attempt — the number a resume must not inflate.
+	method sub-exec-count-for(Str:D $key --> Int:D) {
+		$!lock.protect({ %!sub-exec{$key} // 0 })
+	}
+
+	method process-item(
+		LLM::Data::Pipeline::Context:D $ctx, $item, Str:D $key, :%partial --> Any
+	) {
+		my Int $n = $!lock.protect({
+			%!received-partial{$key} = %partial.Hash;
+			++%!exec-count{$key};
+		});
 		my %s = %!script{$key} // %( kind => 'succeed' );
 		given %s<kind> {
 			when 'succeed'    { return "ok-$key" }
@@ -69,6 +99,37 @@ class ScriptedItemStep does LLM::Data::Pipeline::Step::Items is export {
 			when 'block-then-die' {
 				await %s<promise>;
 				die "blocked-die: $key";
+			}
+			when 'sub-fail' {
+				my Int $units      = (%s<units>      // 3).Int;
+				my Int $fail-at    = (%s<fail-at>    // -1).Int;
+				my Int $fail-times = (%s<fail-times> //  1).Int;
+				# The sink is minted per attempt, exactly as a real step does
+				# it: the Runner binds the active inbox at mint time.
+				my &save = $!runner.defined
+					?? $!runner.partial-sink(:step($!step-name), :$key)
+					!! Callable;
+				# Resume from the partial. A partial whose shape we do not
+				# recognise reads as a fresh start, never a death.
+				my $raw-next = %partial<next>;
+				my Int $start = ($raw-next ~~ Int:D) ?? $raw-next.Int !! 0;
+				$start = 0 if $start < 0 || $start > $units;
+				my @log = ((%partial<log> // []).list.map(*.Str));
+				@log = () if $start == 0;
+				for $start ..^ $units -> $u {
+					if $u == $fail-at {
+						my Int $f = $!lock.protect({
+							++%!sub-fail-count{"$key/$u"};
+						});
+						die "sub-fail: $key unit $u (failure $f)"
+							if $f <= $fail-times;
+					}
+					$!lock.protect({ ++%!sub-exec{$key} });
+					@log.push("$key-$u");
+					&save(%( next => $u + 1, log => @log.Array ))
+						if &save.defined;
+				}
+				return @log.join(',');
 			}
 			default { return "ok-$key" }
 		}

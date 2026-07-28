@@ -309,6 +309,36 @@ $runner.resume($plan, 'run.checkpoint.json'.IO, :retry-dead);
 
 =end code
 
+=head3 Resumable items (0.6.0)
+
+An item that is a B<run of sequential sub-units> — twenty model calls to rewrite
+twenty turns of one chunk — can persist its progress as it goes and be handed it
+back on the next attempt, so a failure on sub-unit 19 no longer throws eighteen
+finished ones away. Opt in with two lines: mint
+C<$runner.partial-sink(:$step, :$key)> and call it with a JSON-safe Hash after
+each completed sub-unit; read C<:%partial> (C<%()> = start fresh) in
+C<process-item>.
+
+=begin code :lang<raku>
+
+method process-item($ctx, $chunk, Str:D $key, :%partial --> Any) {
+    my &save   = $runner.partial-sink(:step(self.name), :$key);
+    my @turns  = (%partial<turns> // []).list.Array;
+    my Int $at = (%partial<next>  // 0).Int;
+    for @($chunk<beats>)[$at ..^ *] -> $beat {
+        @turns.push(write-turn($beat));
+        save({ turns => @turns, next => ++$at });
+    }
+    @turns;
+}
+
+=end code
+
+Partials are state, not events: they ride the checkpoint (C<step-state.partials>,
+trigger C<'partial'>, coalesced by C<checkpoint-every>) and never the event
+stream or the DLQ. They are cleared when the item goes terminal and B<kept>
+across a cancellation, which is what makes a cancelled run resume mid-item.
+
 =head2 run-until-done
 
 Supervise a pipeline to completion across whole-run retries — the outer ring

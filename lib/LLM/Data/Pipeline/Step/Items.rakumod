@@ -20,7 +20,14 @@ method item-key(Int:D $i, $item --> Str:D) { $i.Str }
 #| idempotent — it is B<at-least-once> (a retry re-runs it). The return value is
 #| the item's result, recorded against its key and (via C<finalize>) promoted
 #| into the Context. Throwing triggers the item retry policy.
-method process-item(LLM::Data::Pipeline::Context:D $ctx, $item, Str:D $key --> Any) { ... }
+#|
+#| C<:%partial> (0.6.0) is the sub-unit progress this item last saved through
+#| C<Runner.partial-sink>, or C<%()> when there is none. It is B<opt-in>: a
+#| step that never saves always receives C<%()> and can ignore the argument
+#| entirely (pre-0.6.0 implementations do, via the implicit C<*%_>).
+method process-item(
+	LLM::Data::Pipeline::Context:D $ctx, $item, Str:D $key, :%partial --> Any
+) { ... }
 
 #| Assemble this step's C<provides> from the collected item results. Runs on the
 #| B<coordinator thread> after all items are terminal and the Context is thawed.
@@ -128,12 +135,68 @@ C<execute> (it dies if you do).
       or resume after a crash between processing and checkpoint). Recording is
       exactly-once per checkpoint lineage, so a B<pure> C<process-item> is
       effectively exactly-once; anything with external side effects must be
-      idempotent.
+      idempotent. Saving partials (below) narrows the unit that gets re-run to
+      the sub-unit boundary; it does not remove the requirement.
 
 =item B<Idempotent C<finalize>.> A crash between C<finalize> and the
       step-boundary checkpoint leaves the step not-yet-complete, so a resume
       re-runs C<finalize> over the recovered results. It must derive C<provides>
       purely from the reserved keys / results, never accumulate onto prior state.
+
+=head2 Resumable items: saving sub-unit progress (0.6.0)
+
+An item that is B<one> unit of work needs nothing here. An item that is a run
+of sequential sub-units — twenty model calls to rewrite twenty turns of one
+chunk — should save its progress as it goes, or a failure on sub-unit 19 throws
+eighteen finished ones away and a resume re-runs the lot.
+
+The contract is two halves and it is B<entirely opt-in>:
+
+=item C<process-item> receives C<:%partial> — whatever this item last saved, or
+      C<%()> for "nothing saved, start fresh". Treat a partial whose shape you
+      do not recognise (an older release's, a hand-edited checkpoint) exactly
+      like C<%()>: fall back to a fresh start rather than dying, since a
+      malformed partial must never be able to make an item unprocessable.
+
+=item C<Runner.partial-sink(:$step!, :$key!)> mints the save closure for that
+      item. Call it with a B<JSON-safe Hash> after B<each completed sub-unit> —
+      not before one, not batched — so what is saved is always a prefix of the
+      work that is really done.
+
+=begin code :lang<raku>
+
+method process-item($ctx, $chunk, Str:D $key, :%partial --> Any) {
+	my &save   = $runner.partial-sink(:step(self.name), :$key);
+	my @turns  = (%partial<turns> // []).list.Array;   # already-written turns
+	my Int $at = (%partial<next>  // 0).Int;           # where to resume
+
+	for @($chunk<beats>)[$at ..^ *] -> $beat {
+		@turns.push(write-turn($beat));       # the expensive part
+		$at++;
+		save({ turns => @turns, next => $at });
+	}
+	@turns;
+}
+
+=end code
+
+Two properties make this sound, and both are the step's responsibility:
+
+=item B<The resumed work must be deterministic given the partial.> Anything the
+      loop derives from earlier sub-units (a transcript, a handover line, a
+      running index) must be re-derivable from the partial plus the item — not
+      carried only in a local variable of the attempt that died. If it cannot
+      be re-derived, save it.
+
+=item B<A save is a promise the sub-unit is finished.> The engine hands the
+      partial back verbatim on the next attempt and never re-runs what it
+      covers.
+
+The Runner drops an item's partial the moment the item is recorded done or
+dead-lettered, and C<:retry-dead> requeues an item without one. Cancellation,
+by contrast, B<keeps> partials — that is the point of them. See
+L<LLM::Data::Pipeline::Runner>'s "Resumable items" for the persistence cadence,
+the JSON normalization rule, and the checkpoint-size trade-off.
 
 =head2 Reserved Context keys
 

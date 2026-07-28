@@ -484,11 +484,23 @@ method !run-item-step(
 	my %first-at;  # key => posix seconds of first start
 	my %telem;     # key => { attempts, summary } (last 'exhausted' telemetry)
 	my %in-flight; # key => True (dispatched, awaiting a result)
+	my %partials;  # key => the item's last saved sub-unit progress (Hash)
 
 	# Rehydrate prior progress (resume into an in-progress step).
 	for (%prior<results> // %()).kv -> $k, $v { %done{$k} = $v; }
 	for (%prior<attempts> // %()).kv -> $k, $v { %attempts{$k} = $v; }
 	for (%prior<dead> // %()).keys -> $k { %dead{$k} = True; }
+	# Sub-item partial progress (0.6.0). Keys that are already terminal are
+	# SKIPPED: a done or dead item is never dispatched again, so its partial
+	# could only be resurrected by a later retry-dead — where it would be
+	# stale, because the requeue exists precisely to re-run the item. A
+	# non-Hash value is a hand-edited or corrupted checkpoint; treat it as
+	# absent (the item simply starts fresh) rather than failing the resume.
+	for (%prior<partials> // %()).kv -> $k, $v {
+		next if (%done{$k}:exists) || (%dead{$k}:exists);
+		next unless $v ~~ Associative;
+		%partials{$k} = $v.Hash;
+	}
 
 	%!step-state{$name} //= %();
 	%!step-state{$name}<fingerprint> = %fingerprint;
@@ -527,7 +539,13 @@ method !run-item-step(
 					my Bool $ok = False;
 					my $err;
 					{
-						$value = $step.process-item($ctx, %item-by-key{$key}, $key);
+						# :partial is a named argument, so every pre-0.6.0
+						# process-item — which has an implicit *%_ like any
+						# Raku method — accepts it and ignores it.
+						$value = $step.process-item(
+							$ctx, %item-by-key{$key}, $key,
+							partial => %job<partial>,
+						);
 						$ok = True;
 						CATCH { default { $err = $_ } }
 					}
@@ -587,6 +605,12 @@ method !run-item-step(
 		%!step-state{$name}<results>  = $prune-results ?? %() !! %done.Hash;
 		%!step-state{$name}<attempts> = %attempts.Hash;
 		%!step-state{$name}<dead>     = %dead.keys.map({ $_ => True }).Hash;
+		# In-progress sub-unit state. At :prune-results every key is already
+		# terminal, so %partials is empty anyway — writing %() explicitly
+		# makes the "a completed step carries no partials" invariant hold by
+		# construction rather than by argument, which matters because
+		# retry-dead reopens a completed step's state.
+		%!step-state{$name}<partials> = $prune-results ?? %() !! %partials.Hash;
 	}
 
 	my sub write-cp(Str:D :$trigger!, Bool :$force = False) {
@@ -631,7 +655,13 @@ method !run-item-step(
 	my sub dispatch(Str:D $key) {
 		my Int $attempt = (%attempts{$key} // 0) + 1;
 		%in-flight{$key} = True;
-		$work.send: { :$key, :$attempt };
+		# The LIVE partial, read at dispatch time — so an in-process retry
+		# (which re-enters through 'wake-retry' after the coordinator has
+		# already stored everything the failed attempt saved) hands the
+		# worker the freshest sub-unit state, without ever reading the
+		# checkpoint back. An item with nothing saved gets %(), which the
+		# step reads as "start from the beginning".
+		$work.send: { :$key, :$attempt, partial => (%partials{$key} // %()).Hash };
 	}
 
 	my sub pump() {
@@ -684,6 +714,45 @@ method !run-item-step(
 						data  => %data;
 				}
 			}
+			when 'partial' {
+				# Sub-unit progress saved from INSIDE one item's work. It is
+				# deliberately NOT an event: a partial can be the whole of a
+				# chunk's finished prose, which has no business on the
+				# on-event stream or in the dead-letter journal.
+				my $key = %msg<key>;
+				# Same defence in depth as telemetry: a sink minted while
+				# another step was active must never write here.
+				if (%msg<step> // $name) ne $name {
+					note "partial for step '{%msg<step>}' arrived while step "
+						~ "'$name' is active; dropping.";
+				}
+				elsif !$key.defined || !(%item-by-key{$key}:exists) {
+					note "partial for step '$name' names no item of this step "
+						~ "(key '{$key // '<undefined>'}'); dropping.";
+				}
+				elsif (%done{$key}:exists) || (%dead{$key}:exists) {
+					# A save that lost the race with its own item's terminal
+					# (or arrived after a cancel-time drain recorded one).
+					# Storing it would resurrect state the result arm just
+					# deleted, so the item would resume from a partial for
+					# work that is already recorded.
+				}
+				else {
+					# Normalize through JSON at receipt (D4): the partial a
+					# retry gets from memory is then byte-identical to the one
+					# a resume gets off disk — no "worked in-process, differed
+					# after a restart" class of bug. A partial that cannot
+					# round-trip is a programming error in the step and fails
+					# LOUDLY here, at its first save, rather than at
+					# checkpoint-write time with the item long gone.
+					%partials{$key} = from-json(to-json(%msg<state>)).Hash;
+					# Rides the ordinary coalescing gate, unforced: an
+					# in-process retry never reads the checkpoint (it is
+					# handed the in-memory partial), so coalescing can only
+					# widen the KILL-resume redo window, never the retry one.
+					write-cp(trigger => 'partial');
+				}
+			}
 			when 'result' {
 				my Str $key = %msg<key>;
 				my Int $attempt = %msg<attempt>;
@@ -692,6 +761,10 @@ method !run-item-step(
 
 				if %msg<ok> {
 					%done{$key} = %msg<value>;
+					# The item is recorded: its sub-unit state is now dead
+					# weight, and leaving it would both bloat the checkpoint
+					# and be handed back if retry-dead ever reopened the step.
+					%partials{$key}:delete;
 					self!emit: LLM::Data::Pipeline::Event::ItemCompleted,
 						step => $name, key => $key, attempt => $attempt,
 						duration => %msg<duration>;
@@ -719,6 +792,11 @@ method !run-item-step(
 					} else {
 						# Exhausted → dead-letter. DLQ FIRST, then checkpoint.
 						%dead{$key} = True;
+						# Dead items are terminal too: drop the partial so a
+						# later retry-dead re-runs the item from the start
+						# (its saved sub-units are exactly the ones that led
+						# into the failure).
+						%partials{$key}:delete;
 						self!write-dlq-record(
 							kind      => 'dead',
 							step      => $name,
@@ -791,6 +869,34 @@ method telemetry-sink(Str:D :$step!, Str :$key --> Callable) {
 			.send: { kind => 'telemetry', :$step, key => ($key // Str), data => %data };
 		} else {
 			note "telemetry-sink($step): no active item step; dropping telemetry.";
+		}
+	}
+}
+
+#| A thread-safe B<partial-progress> sink bound to this Runner and to one
+#| C<(step, key)>. The returned closure, when called with a Hash of
+#| sub-unit state, forwards it to the inbox of the item step that was
+#| active B<when the sink was minted> — the same capture-at-mint discipline
+#| C<telemetry-sink> uses, and for the same reason: a late save from an
+#| abandoned attempt can then never land in another step's partial store.
+#|
+#| This is deliberately B<not> telemetry. A partial can be an entire chunk
+#| of generated prose; routing it through the event stream would push it at
+#| every C<&.on-event> consumer and into the dead-letter journal, neither of
+#| which wants it. The coordinator stores it, normalized through JSON, and
+#| hands it back to the next attempt of that item as C<process-item>'s
+#| C<:%partial>. See L<#Resumable items> for the full contract.
+#|
+#| If no item step is active when the sink is minted, it drops with a
+#| C<note> (the direct-construction case in a step's own unit tests).
+method partial-sink(Str:D :$step!, Str:D :$key! --> Callable) {
+	my $bound-inbox = $!current-inbox;   # capture at mint time, not call time
+	-> %state {
+		with $bound-inbox {
+			.send: { kind => 'partial', :$step, :$key, state => %state };
+		} else {
+			note "partial-sink($step/$key): no active item step; "
+				~ "dropping partial.";
 		}
 	}
 }
@@ -924,6 +1030,14 @@ method !apply-retry-dead(@steps, LLM::Data::Pipeline::Context:D $ctx --> Nil) {
 			# No DLQ file at all ⇒ proceed silently (checkpoint is authoritative).
 			(%!step-state{$name}<dead>){$key}:delete;
 			(%!step-state{$name}<attempts>){$key}:delete;
+			# Belt and braces: the dead arm already dropped this key's
+			# partial when it dead-lettered, but a checkpoint written by an
+			# older lineage (or hand-edited) could still carry one, and a
+			# requeued item must re-run from the start — its saved sub-units
+			# are the ones that walked into the failure.
+			if %!step-state{$name}<partials> ~~ Associative {
+				(%!step-state{$name}<partials>){$key}:delete;
+			}
 			self!write-dlq-record(
 				kind     => 'requeued',
 				step     => $name,
@@ -962,6 +1076,12 @@ method !invalidate-downstream(@steps, @reopened, LLM::Data::Pipeline::Context:D 
 			my %items = $ctx.get("{$name}/items") // %();
 			%!step-state{$name}<results> = %items.Hash;
 			%!step-state{$name}<done>    = %items.keys.map({ $_ => True }).Hash;
+			# The reopened step's successes are rehydrated from the reserved
+			# key, so nothing here is mid-item: zero the partials rather than
+			# leaving whatever the pruned state happened to hold. Without
+			# this, a stale partial could survive the reopening and be handed
+			# to an item that is about to run from scratch.
+			%!step-state{$name}<partials> = %();
 		} else {
 			%!step-state{$name}:delete;
 		}
@@ -1187,6 +1307,9 @@ checkpoint-interval  | 0.0     | Minimum seconds between coalesced item checkpoi
 =end table
 
 Dead-letter, step-boundary, and cancel checkpoints are B<never> coalesced away.
+Item-terminal and C<'partial'> (sub-unit progress) checkpoints B<are>: both go
+through the same gate, so the two knobs bound the total checkpoint write rate
+of a step however chatty its items are.
 
 =head2 Checkpoint v2
 
@@ -1198,7 +1321,8 @@ Written atomically (temp file + rename) as:
   "step-state": { "<step>": {
       "fingerprint": {"count": N, "keys-sha256": "…", "items-sha256": "…"},
       "done": {"<key>": true}, "results": {"<key>": ...},
-      "attempts": {"<key>": 2}, "dead": {"<key>": true}, "started-at": "…" } },
+      "attempts": {"<key>": 2}, "dead": {"<key>": true},
+      "partials": {"<key>": {...}}, "started-at": "…" } },
   "updated-at": "…" }
 
 =end code
@@ -1207,7 +1331,13 @@ In-progress item results live in C<step-state.results> while the Context is
 frozen (this is what makes mid-step checkpoints useful for resume); they are
 promoted to the reserved Context key at C<finalize> and pruned. C<done> /
 C<attempts> / C<dead> are kept after completion (C<:retry-dead> needs C<dead>).
-Legacy v1 checkpoints (no C<version> key) are still accepted on resume.
+C<partials> holds the sub-unit progress of items that are B<still in progress>
+(see L<#Resumable items>) and is empty for a completed step. Legacy v1
+checkpoints (no C<version> key) are still accepted on resume, as are v2
+checkpoints written before C<0.6.0> (an absent C<partials> reads as "no item
+has saved any" — every item simply starts from the beginning). The format is
+still B<v2>: partials are purely additive, so a C<0.6.0> checkpoint also loads
+into an older Runner, which ignores the key.
 
 At activation the engine materializes C<items()> once and records a
 fingerprint: C<count>, C<keys-sha256> = SHA-256 of C<to-json> of the key list,
@@ -1216,6 +1346,86 @@ into an in-progress step recomputes all three and throws
 C<X::LLM::Data::Pipeline::CheckpointDrift> on any mismatch — so C<items-sha256>
 catches value-level drift that stable keys (e.g. index keys) cannot. Duplicate
 keys from C<item-key> abort at activation.
+
+=head2 Resumable items (sub-unit progress)
+
+Some items are not one unit of work. A step that rewrites an 89-turn chapter
+makes 89 sequential model calls for B<one> item, and before C<0.6.0> a failure
+on turn 60 threw all 60 finished turns away: the item retried, and
+C<process-item> started again at turn 1. The same was true of a resume — a
+mid-item kill lost the whole item.
+
+An item step can now B<save its sub-unit progress as it goes> and be handed it
+back on the next attempt. Two pieces, both opt-in:
+
+=item C<method partial-sink(:$step!, :$key!)> mints a thread-safe closure for
+      one item. Call it with a JSON-safe Hash after B<each completed sub-unit>;
+      it is a Channel send, so it is safe from the worker thread.
+
+=item C<process-item> receives the item's last saved Hash as the named
+      argument C<:%partial>. C<%()> means "nothing saved — start fresh".
+
+=begin code :lang<raku>
+
+method process-item($ctx, $item, Str:D $key, :%partial --> Any) {
+    my &save = $runner.partial-sink(:step(self.name), :$key);
+
+    # Resume where the last attempt stopped. An empty partial (or one whose
+    # shape you don't recognise) means start from the beginning.
+    my @done  = (%partial<turns> // []).list.Array;
+    my Int $i = (%partial<next> // 0).Int;
+
+    for @($item<turns>)[$i ..^ *] -> $turn {
+        @done.push(write-turn($turn));         # the expensive model call
+        $i++;
+        save({ turns => @done, next => $i });  # after each completed sub-unit
+    }
+    @done;
+}
+
+=end code
+
+B<Cadence.> A partial rides the ordinary checkpoint coalescing gate with
+C<< trigger => 'partial' >>, B<unforced> — so C<checkpoint-every> /
+C<checkpoint-interval> throttle it exactly like item terminals (the default of
+1 persists every save). Coalescing is safe here in a way that is worth stating:
+an in-process retry is handed the B<in-memory> partial and never reads the
+checkpoint, so throttling can only widen the redo window of a B<process kill>,
+never that of a retry.
+
+B<Clearing.> The coordinator drops an item's partial the moment the item
+becomes terminal — on success, on dead-lettering, on a C<:retry-dead> requeue,
+and when C<:retry-dead> reopens a completed step. A completed step's
+C<step-state> therefore carries C<< "partials": {} >>, and a requeued item
+always re-runs from the start (its saved sub-units are the ones that walked
+into the failure). Saves for a key that is already terminal, or minted by a
+different step, are dropped with a C<note>.
+
+B<Cancellation keeps partials.> A cancel drains the in-flight items and their
+saves are still accepted — that is the whole payoff: a run cancelled 60 turns
+into a chunk resumes at turn 61.
+
+B<Normalization (and what a partial must be).> Every partial is normalized
+through JSON at receipt (C<from-json(to-json(…))>), so what a retry gets from
+memory is identical to what a resume gets off disk. A partial that cannot
+round-trip through JSON is a bug in the step and fails B<loudly at its first
+save> rather than at some later checkpoint write. There is deliberately B<no>
+per-partial input digest: the step's item-list fingerprint and the upstream
+steps' completion already pin the inputs, which makes a partial exactly as
+trustworthy as a rehydrated item B<result> — and results have never carried one
+either.
+
+B<Checkpoint size.> While a step is mid-flight its partials can roughly double
+the checkpoint (the in-progress prose is stored alongside the finished items'
+results). Both are pruned at C<finalize>, so the completed-run checkpoint is
+unchanged in size. A step whose partials are genuinely large can trade
+durability for size with C<checkpoint-every>.
+
+B<At-least-once narrows, it does not go away.> C<process-item> is still
+at-least-once, but the unit of re-execution becomes the B<sub-unit boundary>:
+sub-units whose partial was persisted are not re-run, and sub-units after the
+last save are. Any external side effect inside C<process-item> must still be
+idempotent.
 
 =head2 Dead-letter queue (DLQ)
 
@@ -1261,7 +1471,9 @@ while C<attempts> keeps counting.
       artifact this feature exists to produce and is never silently dropped.
 =item C<process-item> is B<at-least-once>; recording is exactly-once per
       checkpoint lineage. A pure C<process-item> is effectively exactly-once; any
-      external side effect must be idempotent.
+      external side effect must be idempotent. A step that saves partials
+      narrows the re-execution unit to the B<sub-unit boundary> (see
+      L<#Resumable items>) but does not change this rule.
 
 =head2 resume(:retry-dead)
 

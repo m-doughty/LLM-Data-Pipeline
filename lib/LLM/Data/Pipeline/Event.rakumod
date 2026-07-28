@@ -446,7 +446,16 @@ run-retry            | RunRetry          | attempt, max-attempts, delay, error, 
 
 The C<step-completed> C<items-done>/C<items-dead> fields are present only for
 C<Step::Items> steps (omitted for plain steps). C<checkpoint-written> C<trigger>
-is one of C<'step'>, C<'item'>, C<'dead-letter'>, or C<'cancel'>.
+is one of C<'step'>, C<'item'>, C<'dead-letter'>, C<'cancel'>, or — since
+C<0.6.0> — C<'partial'> (an item saved sub-unit progress from inside its own
+work; see L<LLM::Data::Pipeline::Runner>'s "Resumable items"). C<'partial'> and
+C<'item'> writes are coalesced by C<checkpoint-every> / C<checkpoint-interval>;
+the other three never are.
+
+Sub-unit progress itself is deliberately B<not> an event: a partial can be the
+whole of an item's generated output, which has no business on the event stream
+or in the dead-letter journal. What a consumer wants for "this item is still
+moving" is the step's own C<telemetry> stream.
 
 C<progress> is emitted B<once at item-step activation> as well (since C<0.5.1>):
 before the step's first C<item-started>, carrying C<in-flight> C<0>, the C<done>
